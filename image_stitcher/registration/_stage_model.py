@@ -11,6 +11,7 @@ translations between microscope image tiles. It includes:
 The module uses statistical methods to ensure robust registration results.
 """
 import itertools
+from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple
 from enum import Enum, auto
 import logging
@@ -105,15 +106,21 @@ def compute_image_overlap2(
     """
     validate_grid_dataframe(grid, direction)
     
-    # Get normalized translations
+    # Get normalized translations (divide by image dimensions to get fraction)
     translation: NDArray = np.array([
         grid[f"{direction}_y_first"].values / sizeY,
         grid[f"{direction}_x_first"].values / sizeX,
     ])
     
-    # Remove NaN values
+    # Remove NaN values and track which rows are valid
     valid_mask = np.all(np.isfinite(translation), axis=0)
     translation = translation[:, valid_mask]
+    
+    # Get filenames for valid translations
+    if 'filename' in grid.columns:
+        valid_filenames = grid['filename'].values[valid_mask]
+    else:
+        valid_filenames = [f"Index_{grid.index[i]}" for i in np.where(valid_mask)[0]]
     
     if translation.shape[1] < MIN_VALID_TRANSLATIONS:
         raise ValueError(
@@ -121,8 +128,30 @@ def compute_image_overlap2(
             f"Need at least {MIN_VALID_TRANSLATIONS}."
         )
     
+    # Print all individual overlap values for manual analysis
+    print(f"\n{'='*80}")
+    print(f"Direction: {direction}")
+    print(f"Number of valid translations: {translation.shape[1]}")
+    print(f"{'='*80}")
+    print(f"Individual overlap values (y, x) as fractions:")
+    for i in range(translation.shape[1]):
+        y_overlap = translation[0, i]
+        x_overlap = translation[1, i]
+        filename = valid_filenames[i] if i < len(valid_filenames) else "UNKNOWN"
+        print(f"  Pair {i+1:3d} [{filename}]: y={y_overlap:7.4f} ({y_overlap*100:6.2f}%), x={x_overlap:7.4f} ({x_overlap*100:6.2f}%)")
+    
     # Compute median overlap
     overlap = np.median(translation, axis=1)
+    
+    # Print statistics
+    print(f"\nStatistics:")
+    print(f"  Y-overlap: median={overlap[0]:7.4f} ({overlap[0]*100:6.2f}%), "
+          f"mean={np.mean(translation[0]):7.4f} ({np.mean(translation[0])*100:6.2f}%), "
+          f"std={np.std(translation[0]):7.4f} ({np.std(translation[0])*100:6.2f}%)")
+    print(f"  X-overlap: median={overlap[1]:7.4f} ({overlap[1]*100:6.2f}%), "
+          f"mean={np.mean(translation[1]):7.4f} ({np.mean(translation[1])*100:6.2f}%), "
+          f"std={np.std(translation[1]):7.4f} ({np.std(translation[1])*100:6.2f}%)")
+    print(f"{'='*80}\n")
     
     # Log overlap values for debugging
     logger.debug(f"Computed {direction} overlap: y={overlap[0]:.3f}, x={overlap[1]:.3f}")
@@ -132,6 +161,89 @@ def compute_image_overlap2(
         raise ValueError("Invalid overlap values > 100% detected")
         
     return tuple(overlap)
+
+@dataclass
+class FilterConfig:
+    """Configuration for translation filtering pipeline."""
+    overlap_left: Float
+    overlap_top: Float
+    size_x: Int
+    size_y: Int
+    pou: Float = 3.0
+    ncc_threshold: Float = 0.1
+    iqr_multiplier: Float = 1.5
+    repeatability: Float = 0.0
+
+
+def filter_translations(
+    grid: pd.DataFrame,
+    config: FilterConfig
+) -> pd.DataFrame:
+    """Unified translation filtering pipeline.
+    
+    Applies all filtering steps in sequence:
+    1. Filter by overlap and correlation (valid1)
+    2. Filter outliers using IQR (valid2)
+    3. Filter by repeatability (valid3)
+    4. Replace invalid translations with estimates
+    
+    Args:
+        grid: DataFrame with translation data
+        config: Filter configuration parameters
+        
+    Returns:
+        Filtered DataFrame with valid3 columns and second columns
+    """
+    # Check which directions have data
+    has_top = "top_y_first" in grid.columns or "top_y" in grid.columns
+    has_left = "left_x_first" in grid.columns or "left_x" in grid.columns
+    
+    # Apply overlap and correlation filter (valid1)
+    if has_top:
+        top_y_col = "top_y_first" if "top_y_first" in grid.columns else "top_y"
+        top_ncc_col = "top_ncc_first" if "top_ncc_first" in grid.columns else "top_ncc"
+        grid["top_valid1"] = filter_by_overlap_and_correlation(
+            grid[top_y_col], grid[top_ncc_col],
+            config.overlap_top, config.size_y, config.pou, config.ncc_threshold
+        )
+    else:
+        grid["top_valid1"] = pd.Series(False, index=grid.index)
+    
+    if has_left:
+        left_x_col = "left_x_first" if "left_x_first" in grid.columns else "left_x"
+        left_ncc_col = "left_ncc_first" if "left_ncc_first" in grid.columns else "left_ncc"
+        grid["left_valid1"] = filter_by_overlap_and_correlation(
+            grid[left_x_col], grid[left_ncc_col],
+            config.overlap_left, config.size_x, config.pou, config.ncc_threshold
+        )
+    else:
+        grid["left_valid1"] = pd.Series(False, index=grid.index)
+    
+    # Apply IQR outlier filter (valid2)
+    if has_top:
+        top_y_col = "top_y_first" if "top_y_first" in grid.columns else "top_y"
+        grid["top_valid2"] = filter_outliers(
+            grid[top_y_col], grid["top_valid1"], config.iqr_multiplier
+        )
+    else:
+        grid["top_valid2"] = pd.Series(False, index=grid.index)
+    
+    if has_left:
+        left_x_col = "left_x_first" if "left_x_first" in grid.columns else "left_x"
+        grid["left_valid2"] = filter_outliers(
+            grid[left_x_col], grid["left_valid1"], config.iqr_multiplier
+        )
+    else:
+        grid["left_valid2"] = pd.Series(False, index=grid.index)
+    
+    # Apply repeatability filter (valid3)
+    grid = filter_by_repeatability(grid, config.repeatability, config.ncc_threshold)
+    
+    # Replace invalid translations
+    grid = replace_invalid_translations(grid)
+    
+    return grid
+
 
 def filter_by_overlap_and_correlation(
     T: pd.Series,

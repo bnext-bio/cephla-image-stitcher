@@ -119,14 +119,17 @@ class DragDropArea(QLabel):
 
 
 class StitcherThread(QThread):
-    def __init__(self, params: StitchingParameters, perform_registration: bool, image_directory: str, tensor_backend_engine: str | None = None) -> None:
+    def __init__(self, params: StitchingParameters, perform_registration: bool, image_directory: str, tensor_backend_engine: str | None = None, register_once: bool = True) -> None:
         super().__init__()
         self.params = params
         self.perform_registration = perform_registration
         self.image_directory = image_directory
         self.tensor_backend_engine = tensor_backend_engine
+        self.register_once = register_once
         self.registration_complete = False
         self.registration_error = None
+        self.flatfield_corrections: dict[int, np.ndarray] | None = None
+        self.flatfield_manifest: pathlib.Path | None = None
         self.callbacks = ProgressCallbacks(
             update_progress=lambda a, b: None,
             getting_flatfields=lambda: None,
@@ -146,7 +149,9 @@ class StitcherThread(QThread):
                     pou=3,                       
                     ncc_threshold=0.5,           
                     edge_width=195,
-                    tensor_backend_engine=self.tensor_backend_engine
+                    tensor_backend_engine=self.tensor_backend_engine,
+                    flatfield_corrections=self.flatfield_corrections,
+                    register_once=self.register_once
                 )
                 logging.info("Registration completed successfully")
                 self.registration_complete = True
@@ -172,12 +177,24 @@ class StitcherThread(QThread):
 
 
 class RegistrationThread(QThread):
-    def __init__(self, image_directory: str, csv_path: str | None, output_csv_path: str | None, tensor_backend_engine: str | None = None) -> None:
+    def __init__(
+        self, 
+        image_directory: str, 
+        csv_path: str | None, 
+        output_csv_path: str | None, 
+        tensor_backend_engine: str | None = None,
+        flatfield_corrections: dict[int, np.ndarray] | None = None,
+        flatfield_manifest: pathlib.Path | None = None,
+        register_once: bool = True
+    ) -> None:
         super().__init__()
         self.image_directory = image_directory
         self.csv_path = csv_path
         self.output_csv_path = output_csv_path
         self.tensor_backend_engine = tensor_backend_engine
+        self.flatfield_corrections = flatfield_corrections
+        self.flatfield_manifest = flatfield_manifest
+        self.register_once = register_once
 
     def run(self) -> None:
         try:
@@ -188,7 +205,9 @@ class RegistrationThread(QThread):
                 pou=3,                      
                 ncc_threshold=0.5,           
                 edge_width=195,
-                tensor_backend_engine=self.tensor_backend_engine
+                tensor_backend_engine=self.tensor_backend_engine,
+                flatfield_corrections=self.flatfield_corrections,
+                register_once=self.register_once
             )
             
             # Emit success signal with number of processed timepoints
@@ -214,13 +233,14 @@ class StitchingGUI(QWidget):
         self.stitcher: StitcherThread | None = (
             None  # Stitcher is initialized when needed
         )
-        self.registration_thread: RegistrationThread | None = None
         self.inputDirectory: str | None = (
             None  # This will be set by the directory selection
         )
         self.output_path = ""
         self.dtype: np.dtype | None = None
         self.flatfield_manifest: pathlib.Path | None = None
+        self.computed_flatfields: dict[int, np.ndarray] | None = None  # Store computed flatfields
+        self.flatfield_computed_params: Any | None = None  # Store computed parameters used for flatfield
         self.initUI()
 
     def initUI(self) -> None:
@@ -236,47 +256,22 @@ class StitchingGUI(QWidget):
         self.inputDirDropArea.path_dropped.connect(self.onInputDirectoryDropped)
         self.mainLayout.addWidget(self.inputDirDropArea, 0, 1)
 
-        # FOV Registration section (previously register button)
-        self.registrationLabel = QLabel("FOV Registration:", self)
-        self.mainLayout.addWidget(self.registrationLabel, 1, 0)
-        self.registrationCombo = QComboBox(self)
-        self.registrationCombo.addItems(["No", "Yes"])
-        self.mainLayout.addWidget(self.registrationCombo, 1, 1)
+        # Start row counter
+        row = 1
         
-        # Tensor Backend section (conditional on registration)
+        # Compute Backend section
         self.tensorBackendLabel = QLabel("Compute Backend:", self)
-        self.mainLayout.addWidget(self.tensorBackendLabel, 2, 0)
+        self.mainLayout.addWidget(self.tensorBackendLabel, row, 0)
         self.tensorBackendCombo = QComboBox(self)
-        self.mainLayout.addWidget(self.tensorBackendCombo, 2, 1)
+        self.mainLayout.addWidget(self.tensorBackendCombo, row, 1)
+        row += 1
         
-        # Initialize backend options and setup connections
+        # Initialize backend options
         self._populate_tensor_backend_options()
-        self._setup_registration_connections()
-
-        # Output format section
-        self.outputFormatLabel = QLabel("Output Format:", self)
-        self.mainLayout.addWidget(self.outputFormatLabel, 3, 0)
-        self.outputFormatCombo = QComboBox(self)
-        self.outputFormatCombo.addItems(["OME-ZARR"])  # Removed OME-TIFF as requested
-        self.mainLayout.addWidget(self.outputFormatCombo, 3, 1)
-
-        # Output compression section
-        self.compressionLabel = QLabel("Output Compression:", self)
-        self.mainLayout.addWidget(self.compressionLabel, 4, 0)
-        self.outputCompression = QComboBox(self)
-        self.outputCompression.addItems(["default", "none"])
-        self.mainLayout.addWidget(self.outputCompression, 4, 1)
-
-        # Pyramid checkbox section - now with checkbox on the right
-        self.pyramidLabel = QLabel("Infer levels for output image pyramid:", self)
-        self.mainLayout.addWidget(self.pyramidLabel, 5, 0)
-        self.pyramidCheckbox = QCheckBox(self)
-        self.pyramidCheckbox.setChecked(True)
-        self.mainLayout.addWidget(self.pyramidCheckbox, 5, 1)
-
-        # Flatfield Correction section
-        self.flatfieldModeLabel = QLabel("Correction Mode:", self)
-        self.mainLayout.addWidget(self.flatfieldModeLabel, 6, 0)
+        
+        # Flatfield Correction section (moved before registration)
+        self.flatfieldModeLabel = QLabel("Flatfield Correction:", self)
+        self.mainLayout.addWidget(self.flatfieldModeLabel, row, 0)
         self.flatfieldModeCombo = QComboBox(self)
         self.flatfieldModeCombo.addItems(
             [
@@ -286,54 +281,121 @@ class StitchingGUI(QWidget):
             ]
         )
         self.flatfieldModeCombo.currentIndexChanged.connect(self.onFlatfieldModeChanged)
-        self.mainLayout.addWidget(self.flatfieldModeCombo, 6, 1)
+        self.mainLayout.addWidget(self.flatfieldModeCombo, row, 1)
+        row += 1
 
         self.flatfieldLoadLabel = QLabel("Load Flatfield:", self)
-        self.mainLayout.addWidget(self.flatfieldLoadLabel, 7, 0)
-        self.flatfieldLoadLabel.setVisible(False) # Initially hidden
+        self.mainLayout.addWidget(self.flatfieldLoadLabel, row, 0)
+        self.flatfieldLoadLabel.setVisible(False)
         self.loadFlatfieldDropArea = DragDropArea("Drag & Drop Flatfield Directory Here", self)
         self.loadFlatfieldDropArea.path_dropped.connect(self.onLoadFlatfieldDropped)
-        self.mainLayout.addWidget(self.loadFlatfieldDropArea, 7, 1)
-        self.loadFlatfieldDropArea.setVisible(False) # Initially hidden
+        self.mainLayout.addWidget(self.loadFlatfieldDropArea, row, 1)
+        self.loadFlatfieldDropArea.setVisible(False)
+        row += 1
+        
+        # Registration checkbox - when checked, registration runs before stitching
+        self.runRegistrationLabel = QLabel("Run Registration:", self)
+        self.mainLayout.addWidget(self.runRegistrationLabel, row, 0)
+        self.runRegistrationCheckbox = QCheckBox(self)
+        self.runRegistrationCheckbox.setChecked(False)  # Default: unchecked
+        self.runRegistrationCheckbox.stateChanged.connect(self.onRegistrationCheckboxChanged)
+        self.mainLayout.addWidget(self.runRegistrationCheckbox, row, 1)
+        row += 1
+
+        # Register once checkbox - only visible when registration is enabled
+        self.registerOnceLabel = QLabel("Register Once (use first timepoint):", self)
+        self.mainLayout.addWidget(self.registerOnceLabel, row, 0)
+        self.registerOnceCheckbox = QCheckBox(self)
+        self.registerOnceCheckbox.setChecked(True)  # Default: checked
+        self.registerOnceCheckbox.setVisible(False)
+        self.mainLayout.addWidget(self.registerOnceCheckbox, row, 1)
+        self.registerOnceLabel.setVisible(False)
+        row += 1
+
+        # Output format section
+        self.outputFormatLabel = QLabel("Output Format:", self)
+        self.mainLayout.addWidget(self.outputFormatLabel, row, 0)
+        self.outputFormatCombo = QComboBox(self)
+        self.outputFormatCombo.addItems(["OME-ZARR"])  # Removed OME-TIFF as requested
+        self.mainLayout.addWidget(self.outputFormatCombo, row, 1)
+        row += 1
+
+        # Output compression section
+        self.compressionLabel = QLabel("Output Compression:", self)
+        self.mainLayout.addWidget(self.compressionLabel, row, 0)
+        self.outputCompression = QComboBox(self)
+        self.outputCompression.addItems(["default", "none"])
+        self.mainLayout.addWidget(self.outputCompression, row, 1)
+        row += 1
+
+        # Pyramid checkbox section - now with checkbox on the right
+        self.pyramidLabel = QLabel("Infer levels for output image pyramid:", self)
+        self.mainLayout.addWidget(self.pyramidLabel, row, 0)
+        self.pyramidCheckbox = QCheckBox(self)
+        self.pyramidCheckbox.setChecked(True)
+        self.mainLayout.addWidget(self.pyramidCheckbox, row, 1)
+        row += 1
 
         # Z-Stack Options section
         self.zLayerLabel = QLabel("Processing Mode:", self)
-        self.mainLayout.addWidget(self.zLayerLabel, 8, 0)
+        self.mainLayout.addWidget(self.zLayerLabel, row, 0)
         self.zLayerModeCombo = QComboBox(self)
         self.zLayerModeCombo.addItems(["Middle Layer", "All Layers", "Specific Layer", "Maximum Intensity Projection (MIP)"])
         self.zLayerModeCombo.currentIndexChanged.connect(self.onZLayerModeChanged)
-        self.mainLayout.addWidget(self.zLayerModeCombo, 8, 1)
+        self.mainLayout.addWidget(self.zLayerModeCombo, row, 1)
+        row += 1
 
         self.zLayerSpinLabel = QLabel("Select Z-Layer Index:", self)
-        self.mainLayout.addWidget(self.zLayerSpinLabel, 9, 0)
+        self.mainLayout.addWidget(self.zLayerSpinLabel, row, 0)
         self.zLayerSpinLabel.setVisible(False) 
 
         self.zLayerSpinBox = QSpinBox(self)
         self.zLayerSpinBox.setMinimum(0)
         self.zLayerSpinBox.setMaximum(999)  # Will be updated based on actual data
-        self.mainLayout.addWidget(self.zLayerSpinBox, 9, 1)
+        self.mainLayout.addWidget(self.zLayerSpinBox, row, 1)
         self.zLayerSpinBox.setVisible(False) 
+        row += 1
 
         # Status and Progress section
         self.statusLabel = QLabel("Status: Ready", self)
-        self.mainLayout.addWidget(self.statusLabel, 10, 0, 1, 2)  
+        self.mainLayout.addWidget(self.statusLabel, row, 0, 1, 2)
+        row += 1
 
         self.progressBar = QProgressBar(self)
         self.progressBar.hide()
-        self.mainLayout.addWidget(self.progressBar, 11, 0, 1, 2)  
+        self.mainLayout.addWidget(self.progressBar, row, 0, 1, 2)
+        row += 1
 
         # Action Buttons
         self.startBtn = QPushButton("Start Stitching", self)
         self.startBtn.clicked.connect(self.onStitchingStart)
-        self.mainLayout.addWidget(self.startBtn, 12, 0)
+        self.startBtn.setEnabled(False)  # Disabled until input directory is selected
+        self.mainLayout.addWidget(self.startBtn, row, 0, 1, 2)  # Span both columns
+        row += 1
+
+        # Output file path section - create horizontal layout for path + button
+        outputPathLayout = QHBoxLayout()
+        self.outputPathEdit = QLineEdit(self)
+        self.outputPathEdit.setPlaceholderText("Path to stitched output file...")
+        self.outputPathEdit.setReadOnly(False)  # Allow manual editing
+        outputPathLayout.addWidget(self.outputPathEdit)
+        
+        self.browseOutputBtn = QPushButton("Browse Files", self)
+        self.browseOutputBtn.clicked.connect(self.onBrowseOutputFile)
+        self.browseOutputBtn.setMaximumWidth(120)  # Make button smaller
+        outputPathLayout.addWidget(self.browseOutputBtn)
+        
+        self.mainLayout.addLayout(outputPathLayout, row, 0, 1, 2)  # Span both columns
+        row += 1
 
         self.viewBtn = QPushButton("View Output", self)
         self.viewBtn.clicked.connect(self.onViewOutput)
         self.viewBtn.setEnabled(False)
-        self.mainLayout.addWidget(self.viewBtn, 12, 1)
+        self.mainLayout.addWidget(self.viewBtn, row, 0, 1, 2)  # Span both columns
+        row += 1
         
         # Add stretch to push everything to the top
-        self.mainLayout.setRowStretch(13, 1) 
+        self.mainLayout.setRowStretch(row, 1) 
 
         self.setWindowTitle("Cephla Image Stitcher")
         self.setGeometry(300, 300, 600, 400)
@@ -357,6 +419,9 @@ class StitchingGUI(QWidget):
             return
 
         self.inputDirectory = str(acquisition_dir)
+        
+        # Enable stitching button
+        self.startBtn.setEnabled(True)
         
         # Detect and display the acquisition format
         try:
@@ -450,7 +515,7 @@ class StitchingGUI(QWidget):
             self.zLayerLabel.setText("Processing Mode:")
 
     def onStitchingStart(self) -> None:
-        """Start stitching from GUI."""
+        """Start stitching from GUI (registration is separate)."""
         if not self.inputDirectory:
             QMessageBox.warning(
                 self, "Input Error", "Please select an input directory."
@@ -458,6 +523,136 @@ class StitchingGUI(QWidget):
             return
 
         try:
+            # Get flatfield mode selection
+            flatfield_mode = get_flatfield_mode_from_string(self.flatfieldModeCombo.currentText())
+            
+            # Check if registration should be run first based on checkbox state
+            perform_registration = self.runRegistrationCheckbox.isChecked()
+            
+            # Handle flatfield computation/loading if needed for registration
+            flatfield_corrections = None
+            flatfield_manifest = None
+            
+            if perform_registration and flatfield_mode != FlatfieldModeOption.NONE:
+                if flatfield_mode == FlatfieldModeOption.COMPUTE:
+                    # Check if flatfields already exist
+                    acquisition_folder = pathlib.Path(self.inputDirectory)
+                    flatfield_dir = acquisition_folder / "flatfields"
+                    auto_flatfield_manifest = flatfield_dir / "flatfield_manifest.json"
+                    
+                    if auto_flatfield_manifest.exists():
+                        # Try to load existing flatfields instead of recomputing
+                        self.statusLabel.setText("Status: Loading existing flatfields...")
+                        QApplication.processEvents()
+                        logging.info(f"Found existing flatfields at {auto_flatfield_manifest}, loading instead of recomputing")
+                        
+                        try:
+                            from .flatfield_utils import load_flatfield_correction
+                            temp_params = StitchingParameters(
+                                input_folder=self.inputDirectory,
+                                output_format=OutputFormat.ome_zarr,
+                                scan_pattern=ScanPattern.unidirectional
+                            )
+                            temp_stitcher = Stitcher(temp_params)
+                            
+                            flatfield_corrections = load_flatfield_correction(
+                                auto_flatfield_manifest,
+                                temp_stitcher.computed_parameters
+                            )
+                            
+                            if flatfield_corrections:
+                                self.computed_flatfields = flatfield_corrections
+                                self.flatfield_computed_params = temp_stitcher.computed_parameters
+                                flatfield_manifest = auto_flatfield_manifest
+                                logging.info(f"Successfully loaded existing flatfields from {auto_flatfield_manifest}")
+                            else:
+                                # Manifest exists but no valid flatfields, compute new ones
+                                logging.warning("Existing flatfield manifest found but no valid flatfields loaded. Computing new ones.")
+                                flatfield_corrections = None
+                                
+                        except Exception as e:
+                            logging.warning(f"Failed to load existing flatfields: {e}. Computing new ones.")
+                            flatfield_corrections = None
+                    else:
+                        flatfield_corrections = None
+                    
+                    # Compute flatfields if not loaded from existing
+                    if not flatfield_corrections:
+                        self.statusLabel.setText("Status: Computing flatfields...")
+                        self.progressBar.setRange(0, 0)
+                        self.progressBar.show()
+                        QApplication.processEvents()  # Update UI
+                        
+                        try:
+                            # Create temporary stitching parameters to compute flatfields
+                            temp_params = StitchingParameters(
+                                input_folder=self.inputDirectory,
+                                output_format=OutputFormat.ome_zarr,
+                                scan_pattern=ScanPattern.unidirectional,
+                                apply_flatfield=False  # Don't apply, just compute
+                            )
+                            temp_stitcher = Stitcher(temp_params)
+                            
+                            # Compute flatfields
+                            from .flatfield_correction import compute_flatfield_correction
+                            flatfield_corrections = compute_flatfield_correction(
+                                temp_stitcher.computed_parameters,
+                                lambda: None  # No progress callback needed
+                            )
+                            
+                            # Save flatfields for later use
+                            if flatfield_corrections:
+                                from .flatfield_utils import save_flatfield_correction
+                                flatfield_manifest = save_flatfield_correction(
+                                    flatfield_corrections,
+                                    temp_stitcher.computed_parameters,
+                                    flatfield_dir
+                                )
+                                self.computed_flatfields = flatfield_corrections
+                                self.flatfield_computed_params = temp_stitcher.computed_parameters
+                                logging.info(f"Computed flatfields saved to {flatfield_dir}, manifest at {flatfield_manifest}")
+                            
+                        except Exception as e:
+                            logging.error(f"Failed to compute flatfields: {e}")
+                            QMessageBox.warning(
+                                self, "Flatfield Warning", 
+                                f"Failed to compute flatfields: {e}\nContinuing registration without flatfield correction."
+                            )
+                            flatfield_corrections = None
+                        
+                elif flatfield_mode == FlatfieldModeOption.LOAD:
+                    # Load precomputed flatfields
+                    if self.flatfield_manifest:
+                        flatfield_manifest = self.flatfield_manifest
+                        try:
+                            from .flatfield_utils import load_flatfield_correction
+                            temp_params = StitchingParameters(
+                                input_folder=self.inputDirectory,
+                                output_format=OutputFormat.ome_zarr,
+                                scan_pattern=ScanPattern.unidirectional
+                            )
+                            temp_stitcher = Stitcher(temp_params)
+                            
+                            flatfield_corrections = load_flatfield_correction(
+                                self.flatfield_manifest,
+                                temp_stitcher.computed_parameters
+                            )
+                            self.computed_flatfields = flatfield_corrections
+                            logging.info("Loaded flatfield corrections for registration")
+                        except Exception as e:
+                            logging.error(f"Failed to load flatfields: {e}")
+                            QMessageBox.warning(
+                                self, "Flatfield Warning",
+                                f"Failed to load flatfields: {e}\nContinuing registration without flatfield correction."
+                            )
+                            flatfield_corrections = None
+                            flatfield_manifest = None
+                    else:
+                        QMessageBox.warning(
+                            self, "Flatfield Warning",
+                            "No flatfield directory selected.\nContinuing registration without flatfield correction."
+                        )
+            
             # Create parameters from UI state
             format_text = self.outputFormatCombo.currentText()
             if format_text == "OME-ZARR":
@@ -466,9 +661,13 @@ class StitchingGUI(QWidget):
                 QMessageBox.critical(self, "Internal Error", f"Invalid output format selected: {format_text}")
                 return
 
-            flatfield_mode = get_flatfield_mode_from_string(self.flatfieldModeCombo.currentText())
             apply_flatfield = flatfield_mode != FlatfieldModeOption.NONE
-            flatfield_manifest = self.flatfield_manifest if flatfield_mode == FlatfieldModeOption.LOAD else None
+            # For stitching: use explicit manifest only when LOAD mode
+            # For COMPUTE mode, let stitcher auto-discover the saved flatfields
+            if flatfield_mode == FlatfieldModeOption.LOAD:
+                flatfield_manifest = self.flatfield_manifest
+            else:
+                flatfield_manifest = None
 
             # Determine z-layer selection strategy
             z_layer_mode = self.zLayerModeCombo.currentIndex()
@@ -490,21 +689,25 @@ class StitchingGUI(QWidget):
                 z_layer_selection=z_layer_selection,
                 apply_mip=(z_layer_mode == 3),  # Set apply_mip based on the combo box index
             )
-
-            # Check if registration is requested and available
-            perform_registration = (
-                self.registrationCombo.currentText() == "Yes" and 
-                self._has_registration_backends and
-                self.tensorBackendCombo.isEnabled()
-            )
-
-            # Create and configure the stitcher thread
+            
+            # Get selected backend if registration is requested
+            tensor_backend_engine = None
+            register_once = self.registerOnceCheckbox.isChecked()
+            if perform_registration:
+                tensor_backend_engine = self._get_selected_tensor_backend()
+            
             self.stitcher = StitcherThread(
                 params=params,
                 perform_registration=perform_registration,
                 image_directory=self.inputDirectory,
-                tensor_backend_engine=self._get_selected_tensor_backend()
+                tensor_backend_engine=tensor_backend_engine,
+                register_once=register_once
             )
+            
+            # Pass flatfield corrections to the stitcher thread for registration
+            if perform_registration and flatfield_corrections:
+                self.stitcher.flatfield_corrections = flatfield_corrections
+                self.stitcher.flatfield_manifest = flatfield_manifest
 
             # Set up callbacks
             self.stitcher.callbacks = ProgressCallbacks(
@@ -521,10 +724,7 @@ class StitchingGUI(QWidget):
             self.setupConnections()
 
             # Start processing
-            if perform_registration:
-                self.statusLabel.setText("Status: Registering images...")
-            else:
-                self.statusLabel.setText("Status: Stitching...")
+            self.statusLabel.setText("Status: Stitching...")
             self.stitcher.start()
             self.progressBar.show()
 
@@ -542,6 +742,14 @@ class StitchingGUI(QWidget):
         """Handle completion of stitching."""
         self.statusLabel.setText("Status: Stitching completed")
         self.progressBar.hide()
+        
+        # Update registration status if it was performed
+        if self.stitcher and self.stitcher.perform_registration:
+            if self.stitcher.registration_complete:
+                self.statusLabel.setText("Status: Registration complete")
+            elif self.stitcher.registration_error:
+                self.statusLabel.setText(f"Status: Registration failed - {self.stitcher.registration_error}")
+        
         logging.info("Image stitching has been completed successfully.")
 
     def onFlatfieldModeChanged(self, idx: int) -> None:
@@ -643,6 +851,12 @@ class StitchingGUI(QWidget):
                 }
             """)
 
+    def onRegistrationCheckboxChanged(self, state: int) -> None:
+        """Handle registration checkbox state changes."""
+        is_checked = (state == Qt.Checked)
+        self.registerOnceLabel.setVisible(is_checked)
+        self.registerOnceCheckbox.setVisible(is_checked)
+
     def onZLayerModeChanged(self, idx: int) -> None:
         """Handle z-layer mode selection changes."""
         # Show/hide specific layer controls based on selection
@@ -654,7 +868,7 @@ class StitchingGUI(QWidget):
             self.zLayerSpinBox.setVisible(False)
 
     def _populate_tensor_backend_options(self) -> None:
-        """Populate the tensor backend dropdown with available options."""
+        """Populate the tensor backend dropdown with available options for registration."""
         # Define backend options with display names
         backend_options = [
             ("Auto (Recommended)", None),
@@ -671,7 +885,7 @@ class StitchingGUI(QWidget):
             else:
                 try:
                     # Test if backend can be created and actually works (no fallback)
-                    backend = create_tensor_backend(engine_name, test_functionality=True, allow_fallback=False)
+                    backend = create_tensor_backend(engine_name, allow_fallback=False)
                     gpu_status = " (GPU)" if backend.is_gpu else " (CPU)"
                     display_with_status = display_name.replace("(GPU/CPU)", gpu_status).replace("(NVIDIA GPU)", gpu_status)
                     self._available_backends.append((display_with_status, engine_name))
@@ -679,60 +893,13 @@ class StitchingGUI(QWidget):
                     # Backend not available, skip it
                     continue
         
-        # Store if any registration backends are available (excluding NumPy-only)
-        self._has_registration_backends = len([b for b in self._available_backends if b[1] != "numpy"]) > 1
-        
-        # Initially populate based on current registration selection
-        self._update_backend_dropdown()
-
-    def _setup_registration_connections(self) -> None:
-        """Setup connections for registration dropdown changes."""
-        self.registrationCombo.currentIndexChanged.connect(self.onRegistrationChanged)
-        # Set initial state
-        self.onRegistrationChanged(0)  # Start with "No" selected
-
-    def onRegistrationChanged(self, idx: int) -> None:
-        """Handle registration selection changes."""
-        registration_enabled = self.registrationCombo.currentText() == "Yes"
-        
-        if registration_enabled:
-            if self._has_registration_backends:
-                # Show backend dropdown with available options
-                self.tensorBackendLabel.setVisible(True)
-                self.tensorBackendCombo.setVisible(True)
-                self._update_backend_dropdown()
-            else:
-                # Show unavailable message
-                self.tensorBackendLabel.setVisible(True) 
-                self.tensorBackendCombo.setVisible(True)
-                self.tensorBackendCombo.clear()
-                self.tensorBackendCombo.addItem("Registration unavailable")
-                self.tensorBackendCombo.setToolTip(
-                    "Registration requires PyTorch or CuPy. Install with:\n"
-                    "pip install torch torchvision  # For PyTorch\n"
-                    "pip install cupy-cuda12x  # For CuPy (NVIDIA GPU)"
-                )
-                self.tensorBackendCombo.setEnabled(False)
-        else:
-            # Hide backend selection when registration is disabled
-            self.tensorBackendLabel.setVisible(False)
-            self.tensorBackendCombo.setVisible(False)
-
-    def _update_backend_dropdown(self) -> None:
-        """Update the backend dropdown with available options."""
-        self.tensorBackendCombo.clear()
-        self.tensorBackendCombo.setEnabled(True)
+        # Populate the backend dropdown
         self._backend_mapping = {}
-        
         for i, (display_name, engine_name) in enumerate(self._available_backends):
             self.tensorBackendCombo.addItem(display_name)
             self._backend_mapping[i] = engine_name
         
-        # Connect change handler if not already connected
-        try:
-            self.tensorBackendCombo.currentIndexChanged.disconnect()
-        except:
-            pass
+        # Connect change handler
         self.tensorBackendCombo.currentIndexChanged.connect(self.onTensorBackendChanged)
         
         # Set default to auto
@@ -752,14 +919,14 @@ class StitchingGUI(QWidget):
             
             if engine_name is None:
                 # Auto selection - detect current backend
-                current_backend = create_tensor_backend(None, test_functionality=True)
+                current_backend = create_tensor_backend(None)
                 backend_name = current_backend.name
                 gpu_status = "GPU" if current_backend.is_gpu else "CPU"
                 status_text = f"Auto-selected: {backend_name.upper()} ({gpu_status})"
             else:
                 # Manual selection
                 try:
-                    selected_backend = create_tensor_backend(engine_name, test_functionality=True, allow_fallback=False)
+                    selected_backend = create_tensor_backend(engine_name, allow_fallback=False)
                     backend_name = selected_backend.name
                     gpu_status = "GPU" if selected_backend.is_gpu else "CPU"
                     status_text = f"Selected: {backend_name.upper()} ({gpu_status})"
@@ -808,6 +975,7 @@ class StitchingGUI(QWidget):
         self.viewBtn.setEnabled(True)
         self.statusLabel.setText("Saving Completed. Ready to View.")
         self.output_path = path
+        self.outputPathEdit.setText(path)  # Update the output path field
         self.dtype = np.dtype(dtype)
         if dtype == np.uint16:
             c = [0, 65535]
@@ -822,6 +990,34 @@ class StitchingGUI(QWidget):
         QMessageBox.critical(self, "Error", f"Error while processing: {error}")
         self.statusLabel.setText("Error Occurred!")
 
+    def onBrowseOutputFile(self) -> None:
+        """Handle the 'Browse Files' button click to select a stitched output file."""
+        # Allow selecting both directories (for .ome.zarr) and files (for .ome.tiff)
+        options = QFileDialog.Options()
+        
+        # Start with directory selection dialog for .ome.zarr files
+        selected_dir = QFileDialog.getExistingDirectory(
+            self,
+            "Select Stitched Output Directory (.ome.zarr)",
+            self.inputDirectory if self.inputDirectory else "",
+            options=options
+        )
+        
+        if selected_dir:
+            # Validate that this is a stitched output
+            selected_path = pathlib.Path(selected_dir)
+            if selected_path.name.endswith('.ome.zarr') or selected_path.name.endswith('_stitched'):
+                self.outputPathEdit.setText(selected_dir)
+                self.output_path = selected_dir
+                self.viewBtn.setEnabled(True)
+            else:
+                QMessageBox.warning(
+                    self, 
+                    "Invalid Selection", 
+                    "Please select a valid stitched output directory (.ome.zarr)"
+                )
+        # Note: Could also add support for .ome.tiff file selection if needed
+
     def onViewOutput(self) -> None:
         """Handle the 'View Output' button click.
         
@@ -832,11 +1028,17 @@ class StitchingGUI(QWidget):
         # Configure logging to see debug output
         logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
         
-        output_path = self.output_path
+        # Get path from the text field (allows user to browse or manually edit)
+        output_path = self.outputPathEdit.text().strip()
         logging.info(f"onViewOutput called with output_path: {output_path}")
         
         if not output_path:
-            QMessageBox.warning(self, "View Error", "No output path set. Has stitching completed?")
+            QMessageBox.warning(self, "View Error", "No output path set. Please browse to select a file or complete stitching first.")
+            return
+        
+        # Validate path exists
+        if not pathlib.Path(output_path).exists():
+            QMessageBox.warning(self, "View Error", f"The specified path does not exist:\n{output_path}")
             return
         
         # Check if this is a wellplate dataset using the same logic as HCS viewer
@@ -1114,47 +1316,41 @@ class StitchingGUI(QWidget):
         )  # Normalize the Blue component
         return Colormap(colors=[c0, c1], controls=[0, 1], name=channel_info["name"])
 
-    def onRegistrationStart(self) -> None:
-        """Start registration from GUI."""
-        if not self.inputDirectory:
-            QMessageBox.warning(
-                self, "Input Error", "Please select an input directory."
-            )
-            return
 
-        try:
-            # Start registration in a separate thread
-            self.registration_thread = RegistrationThread(
-                image_directory=self.inputDirectory,
-                csv_path=None,  # Not needed as process_multiple_timepoints handles this
-                output_csv_path=None  # Not needed as process_multiple_timepoints handles this
-            )
-            self.registration_thread.error.connect(self.onRegistrationError)
-            self.registration_thread.finished.connect(self.onRegistrationFinished)
-
-            # Update UI
-            self.statusLabel.setText("Status: Registering images...")
-            self.progressBar.setRange(0, 0)  # Indeterminate progress
-            self.progressBar.show()
-
-            # Start registration
-            self.registration_thread.start()
-
-        except Exception as e:
-            QMessageBox.critical(self, "Registration Error", str(e))
-            self.statusLabel.setText("Status: Error Encountered")
-
-    def onRegistrationError(self, error_msg: str) -> None:
-        """Handle registration errors."""
-        QMessageBox.critical(self, "Registration Error", error_msg)
-        self.statusLabel.setText("Status: Error Encountered")
-        self.progressBar.hide()
-
-    def onRegistrationFinished(self) -> None:
-        """Handle completion of registration."""
-        self.statusLabel.setText("Status: Registration completed")
-        self.progressBar.hide()
-        logging.info("Image registration has been completed successfully.")
+    def onSetFixedRegistration(self) -> None:
+        """Handle Set Fixed Registration button click."""
+        # TODO: TECHNICAL DEBT - Fixed registration is disabled pending characterization of 
+        # X-Y stage motor drift patterns. The drift accumulation behavior (unidirectional, 
+        # bidirectional, serpentine, etc.) must be determined for each specific microscope 
+        # system before applying fixed shift corrections.
+        
+        QMessageBox.warning(
+            self, 
+            "Feature Disabled", 
+            "Fixed registration is currently disabled.\n\n"
+            "The drift pattern must be determined based on the specific X-Y stage motor "
+            "characteristics of your microscope system.\n\n"
+            "Please use standard registration instead, or contact the development team "
+            "to characterize your system's drift behavior."
+        )
+        self.statusLabel.setText("Status: Fixed registration disabled (technical debt)")
+        return
+        
+        # COMMENTED OUT - Re-enable after characterizing stage motor behavior
+        # if not self.inputDirectory:
+        #     QMessageBox.warning(self, "Input Error", "Please select an input directory.")
+        #     return
+        #     
+        # try:
+        #     from .registration.manual import launch_fixed_registration
+        #     success = launch_fixed_registration(self.inputDirectory)
+        #     if success:
+        #         self.statusLabel.setText("Status: Fixed registration applied")
+        #     else:
+        #         self.statusLabel.setText("Status: Fixed registration cancelled")
+        # except Exception as e:
+        #     QMessageBox.critical(self, "Fixed Registration Error", str(e))
+        #     self.statusLabel.setText("Status: Error in fixed registration")
 
 
 if __name__ == "__main__":

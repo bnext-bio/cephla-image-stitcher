@@ -63,34 +63,6 @@ class TensorBackend(ABC):
         pass
     
     @abstractmethod
-    def where(self, condition: Any, x: Any, y: Any) -> Any:
-        pass
-    
-    @abstractmethod
-    def argsort(self, array: Any) -> Any:
-        pass
-    
-    @abstractmethod
-    def unravel_index(self, indices: Any, shape: Tuple[int, ...]) -> Tuple[Any, Any]:
-        pass
-    
-    @abstractmethod
-    def moveaxis(self, array: Any, source: int, destination: int) -> Any:
-        pass
-    
-    @abstractmethod
-    def all(self, array: Any) -> bool:
-        pass
-    
-    @abstractmethod
-    def any(self, array: Any) -> bool:
-        pass
-    
-    @abstractmethod
-    def flip(self, array: Any, dims: List[int]) -> Any:
-        pass
-    
-    @abstractmethod
     def cleanup_memory(self) -> None:
         pass
 
@@ -101,10 +73,17 @@ class CupyBackend(TensorBackend):
         try:
             import cupy as cp
             self.cp = cp
+            # Test GPU functionality with a simple operation
+            test_array = cp.array([1.0, 2.0, 3.0])
+            _ = cp.sum(test_array)
+            cp.cuda.Device().synchronize()
             self.available = True
         except ImportError:
             self.available = False
             raise ImportError("CuPy not available")
+        except Exception as e:
+            self.available = False
+            raise RuntimeError(f"CuPy available but CUDA operations failed: {e}")
     
     @property
     def name(self) -> str:
@@ -147,29 +126,6 @@ class CupyBackend(TensorBackend):
     def conjugate(self, array: Any) -> Any:
         return self.cp.conjugate(array)
     
-    def where(self, condition: Any, x: Any, y: Any) -> Any:
-        return self.cp.where(condition, x, y)
-    
-    def argsort(self, array: Any) -> Any:
-        return self.cp.argsort(array)
-    
-    def unravel_index(self, indices: Any, shape: Tuple[int, ...]) -> Tuple[Any, Any]:
-        return self.cp.unravel_index(indices, shape)
-    
-    def moveaxis(self, array: Any, source: int, destination: int) -> Any:
-        return self.cp.moveaxis(array, source, destination)
-    
-    def all(self, array: Any) -> bool:
-        return bool(self.cp.all(array))
-    
-    def any(self, array: Any) -> bool:
-        return bool(self.cp.any(array))
-    
-    def flip(self, array: Any, dims: List[int]) -> Any:
-        # CuPy expects axis as int or tuple, not list
-        axis = dims[0] if len(dims) == 1 else tuple(dims)
-        return self.cp.flip(array, axis=axis)
-    
     def cleanup_memory(self) -> None:
         try:
             mempool = self.cp.get_default_memory_pool()
@@ -188,10 +144,20 @@ class TorchBackend(TensorBackend):
             import torch
             self.torch = torch
             self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+            
+            # Test GPU functionality if CUDA is reported as available
+            if self.device == 'cuda':
+                test_tensor = torch.tensor([1.0, 2.0, 3.0], device='cuda')
+                _ = torch.sum(test_tensor)
+                torch.cuda.synchronize()
+            
             self.available = True
         except ImportError:
             self.available = False
             raise ImportError("PyTorch not available")
+        except Exception as e:
+            self.available = False
+            raise RuntimeError(f"PyTorch available but CUDA operations failed: {e}")
     
     @property
     def name(self) -> str:
@@ -257,36 +223,6 @@ class TorchBackend(TensorBackend):
     def conjugate(self, array: Any) -> Any:
         return self.torch.conj(array)
     
-    def where(self, condition: Any, x: Any, y: Any) -> Any:
-        # Ensure all arguments are tensors for PyTorch compatibility
-        condition_tensor = self.asarray(condition) if not hasattr(condition, 'device') else condition
-        x_tensor = self.asarray(x) if not hasattr(x, 'device') else x
-        y_tensor = self.asarray(y) if not hasattr(y, 'device') else y
-        return self.torch.where(condition_tensor, x_tensor, y_tensor)
-    
-    def argsort(self, array: Any) -> Any:
-        # Ensure long dtype for indexing operations
-        return self.torch.argsort(array.flatten()).long()
-    
-    def unravel_index(self, indices: Any, shape: Tuple[int, ...]) -> Tuple[Any, Any]:
-        # PyTorch doesn't have unravel_index, so we implement it
-        indices_np = self.asnumpy(indices)
-        row_np, col_np = np.unravel_index(indices_np, shape)
-        # Ensure integer dtype for indexing
-        return self.asarray(row_np, dtype=self.torch.long), self.asarray(col_np, dtype=self.torch.long)
-    
-    def moveaxis(self, array: Any, source: int, destination: int) -> Any:
-        return self.torch.moveaxis(array, source, destination)
-    
-    def all(self, array: Any) -> bool:
-        return bool(self.torch.all(array))
-    
-    def any(self, array: Any) -> bool:
-        return bool(self.torch.any(array))
-    
-    def flip(self, array: Any, dims: List[int]) -> Any:
-        return self.torch.flip(array, dims=dims)
-    
     def cleanup_memory(self) -> None:
         if self.is_gpu:
             try:
@@ -342,38 +278,14 @@ class NumpyBackend(TensorBackend):
     def conjugate(self, array: Any) -> Any:
         return np.conjugate(array)
     
-    def where(self, condition: Any, x: Any, y: Any) -> Any:
-        return np.where(condition, x, y)
-    
-    def argsort(self, array: Any) -> Any:
-        return np.argsort(array)
-    
-    def unravel_index(self, indices: Any, shape: Tuple[int, ...]) -> Tuple[Any, Any]:
-        return np.unravel_index(indices, shape)
-    
-    def moveaxis(self, array: Any, source: int, destination: int) -> Any:
-        return np.moveaxis(array, source, destination)
-    
-    def all(self, array: Any) -> bool:
-        return bool(np.all(array))
-    
-    def any(self, array: Any) -> bool:
-        return bool(np.any(array))
-    
-    def flip(self, array: Any, dims: List[int]) -> Any:
-        # NumPy expects axis as int or tuple, not list
-        axis = dims[0] if len(dims) == 1 else tuple(dims)
-        return np.flip(array, axis=axis)
-    
     def cleanup_memory(self) -> None:
         pass  # No GPU memory to clean up
 
-def create_tensor_backend(engine: Optional[str] = None, test_functionality: bool = True, allow_fallback: bool = True) -> TensorBackend:
+def create_tensor_backend(engine: Optional[str] = None, allow_fallback: bool = True) -> TensorBackend:
     """Create a tensor backend with optional automatic fallback.
     
     Args:
         engine: Preferred engine ('cupy', 'torch', 'numpy'), None for auto
-        test_functionality: Whether to test basic functionality before returning
         allow_fallback: Whether to try fallback engines if preferred engine fails
         
     Returns:
@@ -406,9 +318,8 @@ def create_tensor_backend(engine: Optional[str] = None, test_functionality: bool
             else:
                 continue
             
-            if test_functionality:
-                _test_backend_functionality(backend)
-            
+            # If backend initialization succeeded, use it
+            # Backend classes handle their own initialization checks
             print(f"Using tensor backend: {backend.name} ({'GPU' if backend.is_gpu else 'CPU'})")
             return backend
             
@@ -417,22 +328,3 @@ def create_tensor_backend(engine: Optional[str] = None, test_functionality: bool
             continue
     
     raise RuntimeError("No tensor backends available")
-
-def _test_backend_functionality(backend: TensorBackend) -> None:
-    """Test basic backend functionality."""
-    try:
-        # Test basic array operations
-        test_array = backend.asarray([[1, 2], [3, 4]], dtype=np.float32)
-        result = backend.mean(test_array)
-        backend.asnumpy(result)
-        
-        # Test FFT operations
-        fft_result = backend.fft2(test_array)
-        ifft_result = backend.ifft2(fft_result)
-        backend.asnumpy(ifft_result)
-        
-        # Clean up
-        backend.cleanup_memory()
-        
-    except Exception as e:
-        raise RuntimeError(f"Backend functionality test failed: {e}")

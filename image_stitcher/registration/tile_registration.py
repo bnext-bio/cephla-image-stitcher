@@ -3,21 +3,10 @@
 This module provides functionality for registering microscope image tiles and updating
 their stage coordinates without performing full image stitching. It includes:
 
-- Tile position extraction and validation
-- Row and column clustering of tiles
-- Translation computation between adjacent tiles
-- Global optimization of tile positions
-- Stage coordinate updates
-
 The module is designed to work with TIFF images and CSV coordinate files from
 microscope acquisition systems.
 
-KEY IMPROVEMENT: Neighborhood-aware batching ensures that tiles and their neighbors
-are always loaded in the same batch, eliminating cross-batch translation failures
-that occurred in previous implementations. This guarantees complete translation
-computation for all valid tile pairs.
-
-CRITICAL FIX: Fixed broken neighbor assignment that was converting NaN values to
+Fixed broken neighbor assignment that was converting NaN values to
 garbage integer indices, creating fake neighbor relationships between tiles that
 shouldn't be neighbors. Now properly preserves NaN for missing neighbors.
 
@@ -26,6 +15,7 @@ that replaces the previous broken register_tiles function.
 """
 import os
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 import re
 import logging
@@ -34,7 +24,7 @@ import multiprocessing as mp
 import json
 import gc
 import psutil
-from typing import Dict, List, Optional, Tuple, Union, Pattern, Iterator, Set
+from typing import Dict, List, Optional, Tuple, Union, Pattern, Set
 from ._typing_utils import BoolArray
 from ._typing_utils import Float
 from ._typing_utils import NumArray
@@ -48,13 +38,10 @@ from ._constrained_refinement import refine_translations
 from ._global_optimization import compute_final_position
 from ._global_optimization import compute_maximum_spanning_tree
 from ._stage_model import compute_image_overlap2
-from ._stage_model import filter_by_overlap_and_correlation
-from ._stage_model import filter_by_repeatability
-from ._stage_model import filter_outliers
-from ._stage_model import replace_invalid_translations
-from ._translation_computation import interpret_translation, interpret_translation_optimized, interpret_translation_subpixel, interpret_translation_ransac
+from ._stage_model import filter_translations, FilterConfig
+from ._translation_computation import compute_translation, TranslationStrategy
 from ._translation_computation import multi_peak_max
-from ._translation_computation import pcm, pcm_subpixel
+from ._translation_computation import pcm
 from ._translation_computation import OptimizationConfig, SubpixelConfig, RANSACConfig
 from ._tensor_backend import TensorBackend, create_tensor_backend
 
@@ -102,6 +89,8 @@ def set_tensor_backend(engine: Optional[str] = None) -> TensorBackend:
 DEFAULT_FOV_RE = re.compile(r"(?P<region>\w+)_(?P<fov>0|[1-9]\d*)_(?P<z_level>\d+)_", re.I)
 # Additional regex for multi-page TIFF files with "_stack" suffix
 MULTIPAGE_FOV_RE = re.compile(r"(?P<region>\w+)_(?P<fov>0|[1-9]\d*)_stack", re.I)
+# Additional regex for OME-TIFF files (region_fov.ome.tif)
+OME_TIFF_FOV_RE = re.compile(r"(?P<region>\w+)_(?P<fov>0|[1-9]\d*)\.ome\.tiff?$", re.I)
 DEFAULT_FOV_COL = "fov"
 DEFAULT_X_COL = "x (mm)"
 DEFAULT_Y_COL = "y (mm)"
@@ -129,7 +118,7 @@ DEFAULT_Y_COL = "y (mm)"
 # but should be replaced with the proper abstraction in a future refactor.
 
 def parse_filename_fov_info(filename: str) -> Optional[Dict[str, Union[str, int]]]:
-    """TEMPORARY HELPER: Parse FOV info from filename, handling both regular and multi-page TIFF formats.
+    """TEMPORARY HELPER: Parse FOV info from filename, handling regular, multi-page, and OME-TIFF formats.
     
     WARNING: This function duplicates regex logic and should be replaced with a proper
     FileFormat abstraction. See TODO comment above for the recommended approach.
@@ -144,7 +133,16 @@ def parse_filename_fov_info(filename: str) -> Optional[Dict[str, Union[str, int]
     Optional[Dict[str, Union[str, int]]]
         Dictionary with 'region', 'fov', and optionally 'z_level' keys, or None if no match
     """
-    # Try regular TIFF pattern first
+    # Try OME-TIFF pattern first (most specific)
+    m = OME_TIFF_FOV_RE.search(filename)
+    if m:
+        return {
+            'region': m.group('region'),
+            'fov': int(m.group('fov'))
+            # No z_level in OME-TIFF filenames - it's stored inside the file
+        }
+    
+    # Try regular TIFF pattern
     m = DEFAULT_FOV_RE.search(filename)
     if m:
         return {
@@ -171,6 +169,18 @@ ROW_TOL_FACTOR = 0.20  # Tolerance factor for row clustering
 COL_TOL_FACTOR = 0.20  # Tolerance factor for column clustering
 DEFAULT_EDGE_WIDTH = 256  # Increased from 64 to 256 for better correlation with 2048x2048 tiles
 
+
+# ============================================================================
+# DATA STRUCTURES
+# ============================================================================
+
+class RegistrationMode(Enum):
+    """Mode for tile registration operations."""
+    SINGLE = "single"
+    AUTO = "auto"
+    MULTI_TIMEPOINT = "multi"
+
+
 @dataclass
 class Neighborhood:
     """A tile and its required neighbors for translation computation."""
@@ -186,6 +196,23 @@ class Neighborhood:
         if self.top_idx is not None:
             indices.add(self.top_idx)
         return indices
+
+
+@dataclass
+class RowInfo:
+    """Information about a row of tiles.
+    
+    Attributes:
+        center_y: Y-coordinate of the row center in mm
+        tile_indices: List of indices for tiles in this row
+    """
+    center_y: float
+    tile_indices: List[int]
+
+
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
 
 def create_neighborhoods(master_grid: pd.DataFrame) -> List[Neighborhood]:
     """Create neighborhoods for all tiles that need translation computation."""
@@ -249,7 +276,10 @@ def group_neighborhoods_into_batches(
 def load_batch_for_neighborhoods(
     neighborhood_batch: List[Neighborhood],
     selected_tiff_paths: List[Path],
-    all_filenames: List[str]
+    all_filenames: List[str],
+    flatfield: Optional[np.ndarray] = None,
+    fov_to_z_level: Optional[Dict[int, int]] = None,
+    channel: int = 0
 ) -> Tuple[Dict[str, np.ndarray], List[int]]:
     """Load all unique images needed for a batch of neighborhoods."""
     
@@ -262,7 +292,7 @@ def load_batch_for_neighborhoods(
     
     # Load all needed images
     needed_paths = [selected_tiff_paths[i] for i in needed_indices_list]
-    batch_images = load_batch_images(needed_paths)
+    batch_images = load_batch_images(needed_paths, flatfield=flatfield, fov_to_z_level=fov_to_z_level, channel=channel)
     
     return batch_images, needed_indices_list
 
@@ -336,6 +366,153 @@ def process_neighborhood_batch(
     
     return results
 
+def select_best_registration_channel(
+    selected_tiff_paths: List[Path],
+    region_coords: pd.DataFrame,
+    edge_width: int = DEFAULT_EDGE_WIDTH,
+    num_sample_fovs: int = 3,
+    fov_to_z_level: Optional[Dict[int, int]] = None
+) -> int:
+    """Select the channel with highest edge variance for registration.
+    
+    Samples random FOVs, loads all available channels, and computes edge variance
+    to determine which channel has the most features for reliable registration.
+    
+    Works with both OME-TIFF files (multiple channels per file) and individual
+    TIFF files (one file per channel).
+    
+    Args:
+        selected_tiff_paths: List of image file paths
+        region_coords: Coordinates DataFrame
+        edge_width: Width of edge strips to check
+        num_sample_fovs: Number of random FOVs to sample (default 3)
+        fov_to_z_level: Optional z-level mapping for multi-z datasets
+        
+    Returns:
+        Best channel index (0-based) to use for registration
+    """
+    from ..image_loaders import ChannelSource
+    
+    # Get unique FOVs and regions
+    fov_region_pairs = set()
+    for path in selected_tiff_paths:
+        fov_info = parse_filename_fov_info(path.name)
+        if fov_info and 'fov' in fov_info:
+            region = fov_info.get('region', 'Unknown')
+            fov = fov_info['fov']
+            fov_region_pairs.add((region, fov))
+    
+    if not fov_region_pairs:
+        logger.warning("Could not parse any FOV information from filenames - using default channel 0")
+        return 0
+    
+    # Sample random FOVs
+    fov_region_list = list(fov_region_pairs)
+    if len(fov_region_list) <= num_sample_fovs:
+        sample_pairs = fov_region_list
+    else:
+        sample_indices = np.random.choice(len(fov_region_list), num_sample_fovs, replace=False)
+        sample_pairs = [fov_region_list[i] for i in sample_indices]
+    
+    logger.info(f"Checking edge variance across channels for {len(sample_pairs)} random FOVs: {sample_pairs}")
+    
+    # Compute edge variance per channel across sampled FOVs
+    channel_variances = {}
+    all_channel_names = None
+    
+    for region, fov in sample_pairs:
+        try:
+            # Determine z-level for this FOV
+            z_level = fov_to_z_level.get(fov) if fov_to_z_level else None
+            
+            # Discover channels for this FOV (format-agnostic)
+            descriptors = ChannelSource.discover(
+                files=selected_tiff_paths,
+                region=region,
+                fov=fov,
+                z_level=z_level
+            )
+            
+            if not descriptors:
+                logger.warning(f"No channels found for FOV {region}_{fov}")
+                continue
+            
+            # Store channel names from first FOV for display
+            if all_channel_names is None:
+                all_channel_names = [desc.name for desc in descriptors]
+            
+            # Compute variance for each channel
+            for desc in descriptors:
+                img = desc.loader.read_slice(
+                    channel=desc.channel_param,
+                    z=desc.z_param
+                )
+                
+                # Extract right edge (most common overlap direction)
+                current_w = min(edge_width, img.shape[1])
+                edge = img[:, -current_w:]
+                
+                # Compute variance (same as is_edge_featureless)
+                downsampled = edge[::16, ::16]
+                if downsampled.size > 0:
+                    variance = np.var(downsampled.astype(np.float32))
+                    
+                    if desc.index not in channel_variances:
+                        channel_variances[desc.index] = []
+                    channel_variances[desc.index].append(variance)
+        
+        except Exception as e:
+            logger.warning(f"Failed to check channels for FOV {region}_{fov}: {e}")
+            continue
+    
+    if not channel_variances:
+        logger.warning("Could not compute channel variances - using default channel 0")
+        return 0
+    
+    # Compute mean variance per channel and select best
+    channel_mean_variance = {ch: np.mean(vars) for ch, vars in channel_variances.items()}
+    best_channel = max(channel_mean_variance.items(), key=lambda x: x[1])[0]
+    
+    # Log results
+    logger.warning(f"Channel variance analysis (mean across {len(sample_pairs)} FOVs):")
+    for ch in sorted(channel_mean_variance.keys()):
+        status = " ← SELECTED" if ch == best_channel else ""
+        ch_name = all_channel_names[ch] if all_channel_names and ch < len(all_channel_names) else f"Channel {ch}"
+        logger.warning(f"  {ch_name}: variance={channel_mean_variance[ch]:.2e}{status}")
+    
+    return best_channel
+
+
+def is_edge_featureless(edge: np.ndarray, variance_threshold: float = 2e3) -> bool:
+    """Check if edge strip is featureless (dust speckles only, no tissue).
+    
+    Checks only the edge region being registered, not the full tile.
+    This prevents false positives where a tile has tissue in center but empty edges.
+    
+    Args:
+        edge: 2D edge strip array (e.g., 2048x195)
+        variance_threshold: Variance threshold (default 2e3 - lowered to accept more edges)
+        
+    Returns:
+        True if featureless (skip registration), False otherwise
+    """
+    # Downsample 16x for speed
+    downsampled = edge[::16, ::16]
+    if downsampled.size == 0:
+        return True  # Empty edge is featureless
+    
+    variance = np.var(downsampled.astype(np.float32))
+    is_featureless = variance < variance_threshold
+    
+    if is_featureless:
+        logger.warning(
+            f"Edge rejected as featureless: variance={variance:.2e} < threshold={variance_threshold:.2e}. "
+            f"Edge shape={edge.shape}, intensity range=[{edge.min()}, {edge.max()}]. "
+            f"Consider using a different channel for registration if multiple channels are available."
+        )
+    
+    return is_featureless
+
 def compute_single_translation(
     image1_full: np.ndarray,
     image2_full: np.ndarray, 
@@ -363,6 +540,10 @@ def compute_single_translation(
         
         if edge1.size == 0 or edge2.size == 0:
             return None
+        
+        # Check if edge strips are featureless (dust only, no tissue)
+        if is_edge_featureless(edge1) or is_edge_featureless(edge2):
+            return None  # Skip registration, use stage coordinates only
             
         edge_sizeY, edge_sizeX = edge1.shape
         
@@ -372,14 +553,14 @@ def compute_single_translation(
         
         yins_edge, xins_edge, _ = multi_peak_max(PCM_on_edges)
         
-        # interpret_translation with RANSAC + subpixel + optimization (ultimate method)
-        ncc_val, y_best_edge_relative, x_best_edge_relative = interpret_translation_ransac(
+        # Compute translation with RANSAC strategy (includes subpixel + optimization)
+        ncc_val, y_best_edge_relative, x_best_edge_relative = compute_translation(
             edge1, edge2, yins_edge, xins_edge, 
             *lims_edge_relative[0], *lims_edge_relative[1],
-            n=10,  # More candidates for RANSAC
+            strategy=TranslationStrategy.RANSAC,
+            n=10,
             ransac_config=RANSACConfig(use_ransac=True, residual_threshold=2.0, min_inlier_ratio=0.3),
             subpixel_config=SubpixelConfig(upsample_factor=100, use_subpixel=True),
-            use_continuous_optimization=True,
             optimization_config=OptimizationConfig(method='trf', max_nfev=50, verbose=0)
         )
         
@@ -412,23 +593,39 @@ def calculate_safe_batch_size(first_image_path: Path, memory_fraction: float = 0
     
     return max_batch_size
 
-def batch_paths(paths: List[Path], batch_size: int) -> Iterator[List[Path]]:
-    """Split paths into batches of specified size."""
-    for i in range(0, len(paths), batch_size):
-        yield paths[i:i + batch_size]
 
-def load_batch_images(batch_paths: List[Path]) -> Dict[str, np.ndarray]:
-    """Load a batch of images using multiprocessing."""
+def _load_image_wrapper(args: Tuple[Path, Optional[Dict[int, int]], int]) -> Tuple[str, Optional[np.ndarray]]:
+    """Load image without flatfield correction (for multiprocessing)."""
+    path, fov_to_z_level, channel = args
+    return load_single_image(path, flatfield=None, fov_to_z_level=fov_to_z_level, channel=channel)
+
+def load_batch_images(
+    batch_paths: List[Path], 
+    flatfield: Optional[np.ndarray] = None,
+    fov_to_z_level: Optional[Dict[int, int]] = None,
+    channel: int = 0
+) -> Dict[str, np.ndarray]:
+    """Load a batch of images using multiprocessing, apply flatfield serially."""
     n_processes = min(cpu_count(), len(batch_paths))
     
+    # Load images in parallel without flatfield
+    # Pack fov_to_z_level and channel with each path for multiprocessing
+    args_list = [(path, fov_to_z_level, channel) for path in batch_paths]
     with Pool(processes=n_processes) as pool:
         results = list(tqdm(
-            pool.imap(load_single_image, batch_paths),
+            pool.imap(_load_image_wrapper, args_list),
             total=len(batch_paths),
             desc="Loading batch"
         ))
     
-    return {k: v for k, v in results if v is not None}
+    images = {k: v for k, v in results if v is not None}
+    
+    # Apply flatfield correction serially if provided
+    if flatfield is not None:
+        for filename, image in images.items():
+            images[filename] = apply_flatfield_to_image(image, flatfield, dtype=image.dtype)
+    
+    return images
 
 def register_tiles_batched(
     selected_tiff_paths: List[Path],
@@ -438,9 +635,13 @@ def register_tiles_batched(
     pou: float = 3,
     ncc_threshold: float = 0.5,
     z_slice_to_keep: Optional[int] = 0,
-    tensor_backend_engine: Optional[str] = None
+    tensor_backend_engine: Optional[str] = None,
+    flatfield_corrections: Optional[Dict[int, np.ndarray]] = None,
+    registration_channel: int = 0
 ) -> Tuple[pd.DataFrame, dict]:
-    """Register tiles using memory-constrained batched processing.
+    """[DEPRECATED] Use register_tiles(mode=RegistrationMode.SINGLE) instead.
+    
+    Register tiles using memory-constrained batched processing.
     
     Parameters
     ----------
@@ -460,6 +661,10 @@ def register_tiles_batched(
         Z-slice to use for registration
     tensor_backend_engine : Optional[str]
         Preferred tensor backend engine ('cupy', 'torch', 'numpy', None for auto)
+    flatfield_corrections : Optional[Dict[int, np.ndarray]]
+        Precomputed flatfield corrections indexed by channel
+    flatfield_manifest : Optional[Path]
+        Path to flatfield manifest file to load corrections
         
     Returns
     -------
@@ -487,7 +692,7 @@ def register_tiles_batched(
     
     # Create complete grid structure BEFORE batching
     all_filenames = [p.name for p in selected_tiff_paths]
-    rows, cols, filename_to_index = extract_tile_indices(all_filenames, region_coords)
+    rows, cols, filename_to_index, fov_to_z_level = extract_tile_indices(all_filenames, region_coords)
     
     # DEBUG: Show grid structure
     print(f"DEBUG: Grid dimensions: {len(rows)} tiles, {len(set(rows))} unique rows, {len(set(cols))} unique columns")
@@ -498,17 +703,11 @@ def register_tiles_batched(
     print("\nDEBUG: FOV to Grid Position Mapping:")
     print("=" * 80)
     for i, (filename, row, col) in enumerate(zip(all_filenames[:20], rows[:20], cols[:20])):  # Show first 20
-        # Extract FOV from filename
-        m = DEFAULT_FOV_RE.search(filename)
+        # Extract FOV from filename using the proper parser
+        fov_info = parse_filename_fov_info(filename)
         fov_num = "UNKNOWN"
-        if m:
-            try:
-                if 'fov' in m.groupdict():
-                    fov_num = m.group('fov')
-                else:
-                    fov_num = m.group(1)
-            except:
-                pass
+        if fov_info and 'fov' in fov_info:
+            fov_num = str(fov_info['fov'])
         
         # Get stage coordinates
         coord_idx = filename_to_index.get(filename, "NOT_FOUND")
@@ -522,10 +721,27 @@ def register_tiles_batched(
     if len(all_filenames) > 20:
         print(f"... (showing first 20 of {len(all_filenames)} total)")
     
-    # Initialize master grid with complete structure
+    # Initialize master grid with complete structure including stage coordinates
+    # Use existing filename_to_index mapping to get coordinates
+    stage_x_list = []
+    stage_y_list = []
+    
+    for filename in all_filenames:
+        coord_idx = filename_to_index.get(filename)
+        if coord_idx is not None and coord_idx in region_coords.index:
+            stage_x_list.append(float(region_coords.loc[coord_idx, 'x (mm)']))
+            stage_y_list.append(float(region_coords.loc[coord_idx, 'y (mm)']))
+        else:
+            # Fallback to 0,0 if no match (shouldn't happen)
+            stage_x_list.append(0.0)
+            stage_y_list.append(0.0)
+    
     master_grid = pd.DataFrame({
         "col": cols,
         "row": rows,
+        "stage_x": stage_x_list,
+        "stage_y": stage_y_list,
+        "filename": all_filenames,
     }, index=np.arange(len(cols)))
     
     # DEBUG: Show grid occupancy matrix
@@ -611,9 +827,72 @@ def register_tiles_batched(
     # Create neighborhoods and group into memory-constrained batches
     neighborhoods = create_neighborhoods(master_grid)
     
-    # Calculate memory constraints
-    first_image = tifffile.imread(str(selected_tiff_paths[0]))
+    if not neighborhoods:
+        raise ValueError(
+            f"No valid neighborhoods found. Grid has {len(master_grid)} tiles but no valid "
+            f"neighbor relationships. Check that tiles have proper row/col assignments."
+        )
+    
+    # Auto-select best registration channel for OME-TIFF (channels inside file)
+    # For individual files, channel selection happens upstream before this function
+    is_ome_tiff = any(p.name.lower().endswith(('.ome.tif', '.ome.tiff')) for p in selected_tiff_paths)
+    
+    if registration_channel == 0 and is_ome_tiff:
+        best_channel = select_best_registration_channel(
+            selected_tiff_paths, 
+            region_coords,
+            edge_width=edge_width,
+            num_sample_fovs=3,
+            fov_to_z_level=fov_to_z_level
+        )
+        if best_channel != 0:
+            logger.warning(f"Auto-selected channel {best_channel} for registration")
+            registration_channel = best_channel
+    
+    # Load first image once for both memory estimation and flatfield validation
+    _, first_image = load_single_image(selected_tiff_paths[0], flatfield=None, fov_to_z_level=fov_to_z_level)
+    
+    # Get flatfield for registration (use specified channel)
+    flatfield_for_registration = None
+    if flatfield_corrections:
+        # Try specified registration channel first
+        flatfield_for_registration = flatfield_corrections.get(registration_channel, None)
+        
+        if flatfield_for_registration is None:
+            available_channels = list(flatfield_corrections.keys())
+            
+            # If non-default channel explicitly requested but not found, raise error
+            if registration_channel != 0 and available_channels:
+                raise ValueError(
+                    f"Registration channel {registration_channel} not found in flatfield_corrections. "
+                    f"Available channels: {available_channels}. "
+                    f"Please specify a valid registration_channel parameter."
+                )
+            
+            # For default channel (0), fall back to first available
+            if available_channels:
+                fallback_channel = available_channels[0]
+                flatfield_for_registration = flatfield_corrections[fallback_channel]
+                logging.warning(
+                    f"Default registration channel {registration_channel} not found. "
+                    f"Using channel {fallback_channel} instead. Available channels: {available_channels}"
+                )
+        
+        # Validate flatfield shape matches image dimensions before processing
+        if flatfield_for_registration is not None:
+            if flatfield_for_registration.shape != first_image.shape:
+                raise ValueError(
+                    f"Flatfield shape {flatfield_for_registration.shape} does not match "
+                    f"image shape {first_image.shape}. Cannot apply flatfield correction."
+                )
+            logging.info(
+                f"Using flatfield correction for registration from channel {registration_channel} "
+                f"(shape: {flatfield_for_registration.shape})"
+            )
+    
+    # Calculate memory constraints using the already-loaded first_image
     max_memory = calculate_safe_batch_size(selected_tiff_paths[0]) * first_image.nbytes * 8
+    
     del first_image
     gc.collect()
     
@@ -626,7 +905,12 @@ def register_tiles_batched(
         print(f"Processing neighborhood batch {batch_idx + 1}/{len(neighborhood_batches)} with {len(neighborhood_batch)} neighborhoods")
         
         # Load all images needed for this batch
-        batch_images, needed_indices = load_batch_for_neighborhoods(neighborhood_batch, selected_tiff_paths, all_filenames)
+        batch_images, needed_indices = load_batch_for_neighborhoods(
+            neighborhood_batch, selected_tiff_paths, all_filenames,
+            flatfield=flatfield_for_registration,
+            fov_to_z_level=fov_to_z_level,
+            channel=registration_channel
+        )
         
         print(f"DEBUG: Loaded {len(batch_images)} unique images for {len(needed_indices)} indices")
         
@@ -685,11 +969,10 @@ def register_tiles_batched(
     if not has_left_pairs and not has_top_pairs:
         raise ValueError("No good initial pairs found - tiles may not have sufficient overlap")
     
-    # Get image dimensions from first batch for overlap calculation
-    first_image = tifffile.imread(str(selected_tiff_paths[0]))
-    full_sizeY, full_sizeX = first_image.shape[:2]
-    del first_image
-    gc.collect()
+    # Get standardized image dimensions (always returns Y, X regardless of format)
+    from ..image_loaders import get_image_dimensions
+    full_sizeY, full_sizeX = get_image_dimensions(selected_tiff_paths[0])
+    print(f"DEBUG: Image dimensions: Y={full_sizeY}, X={full_sizeX}")
     
     # Compute overlaps and continue with existing logic
     if has_left_pairs:
@@ -710,32 +993,28 @@ def register_tiles_batched(
     else:
         overlap_top = 50.0
     
-    # Apply filtering (existing logic)
-    if has_top_pairs:
-        master_grid["top_valid1"] = filter_by_overlap_and_correlation(
-            master_grid["top_y_first"], master_grid["top_ncc_first"], 
-            overlap_top, full_sizeY, pou, ncc_threshold
-        )
-        master_grid["top_valid2"] = filter_outliers(master_grid["top_y_first"], master_grid["top_valid1"])
-    else:
-        master_grid["top_valid1"] = pd.Series(False, index=master_grid.index)
-        master_grid["top_valid2"] = pd.Series(False, index=master_grid.index)
-    
-    if has_left_pairs:
-        master_grid["left_valid1"] = filter_by_overlap_and_correlation(
-            master_grid["left_x_first"], master_grid["left_ncc_first"], 
-            overlap_left, full_sizeX, pou, ncc_threshold
-        )
-        master_grid["left_valid2"] = filter_outliers(master_grid["left_x_first"], master_grid["left_valid1"])
-    else:
-        master_grid["left_valid1"] = pd.Series(False, index=master_grid.index)
-        master_grid["left_valid2"] = pd.Series(False, index=master_grid.index)
-    
-    # Compute repeatability and apply remaining filters
+    # Compute repeatability (needed for filter config)
     rs = []
     for direction, dims_chars, rowcol_group_key in zip(["top", "left"], ["yx", "xy"], ["col", "row"]):
-        valid_key = f"{direction}_valid2"
-        valid_grid_subset = master_grid[master_grid[valid_key].fillna(False)]
+        # Calculate valid translations for repeatability computation
+        if direction == "top" and has_top_pairs:
+            temp_valid = (
+                master_grid["top_y_first"].between(
+                    full_sizeY * (100 - overlap_top - pou) / 100,
+                    full_sizeY * (100 - overlap_top + pou) / 100
+                ) & (master_grid["top_ncc_first"] > ncc_threshold)
+            )
+            valid_grid_subset = master_grid[temp_valid.fillna(False)]
+        elif direction == "left" and has_left_pairs:
+            temp_valid = (
+                master_grid["left_x_first"].between(
+                    full_sizeX * (100 - overlap_left - pou) / 100,
+                    full_sizeX * (100 - overlap_left + pou) / 100
+                ) & (master_grid["left_ncc_first"] > ncc_threshold)
+            )
+            valid_grid_subset = master_grid[temp_valid.fillna(False)]
+        else:
+            valid_grid_subset = pd.DataFrame()
         
         if len(valid_grid_subset) > 0:
             w1s = valid_grid_subset[f"{direction}_{dims_chars[0]}_first"]
@@ -753,8 +1032,18 @@ def register_tiles_batched(
     
     r_repeatability = np.max(rs) if rs else 0
     
-    master_grid = filter_by_repeatability(master_grid, r_repeatability, ncc_threshold)
-    master_grid = replace_invalid_translations(master_grid)
+    # Apply unified filtering pipeline
+    filter_config = FilterConfig(
+        overlap_left=overlap_left,
+        overlap_top=overlap_top,
+        size_x=full_sizeX,
+        size_y=full_sizeY,
+        pou=pou,
+        ncc_threshold=ncc_threshold,
+        iqr_multiplier=1.5,
+        repeatability=r_repeatability
+    )
+    master_grid = filter_translations(master_grid, filter_config)
     
     # DEBUG: Show master grid state before spanning tree computation
     print("DEBUG: Master grid state before spanning tree computation:")
@@ -822,10 +1111,10 @@ def register_tiles_batched(
     print(f"  - Actual edge width used (top): {min(edge_width, full_sizeY)} ({100*min(edge_width, full_sizeY)/full_sizeY:.1f}% of image height)")
     
     if edge_width >= full_sizeX * 0.5:
-        print(f"  ⚠️  WARNING: edge_width ({edge_width}) is ≥50% of image width ({full_sizeX})")
+        print(f"  WARNING: edge_width ({edge_width}) is >=50% of image width ({full_sizeX})")
         print(f"     This may cause unstable registration as overlapping regions become too large!")
     if edge_width >= full_sizeY * 0.5:
-        print(f"  ⚠️  WARNING: edge_width ({edge_width}) is ≥50% of image height ({full_sizeY})")
+        print(f"  WARNING: edge_width ({edge_width}) is >=50% of image height ({full_sizeY})")
         print(f"     This may cause unstable registration as overlapping regions become too large!")
     
     tree = compute_maximum_spanning_tree(master_grid)
@@ -858,7 +1147,22 @@ def register_tiles_batched(
     print("DEBUG: Spanning tree computation successful!")
     print(f"DEBUG: Tree has {len(tree.nodes)} nodes and {len(tree.edges)} edges")
     
-    master_grid = compute_final_position(master_grid, tree)
+    # Calculate pixel size from stage coordinates for isolated tile positioning
+    pixel_size_um = None
+    try:
+        # Quick estimate from first adjacent pair
+        for idx in range(len(master_grid) - 1):
+            left_idx = master_grid.loc[idx, 'left']
+            if pd.notna(left_idx):
+                dx_mm = abs(master_grid.loc[idx, 'stage_x'] - master_grid.loc[int(left_idx), 'stage_x'])
+                if dx_mm > 0:
+                    # Estimate from stage spacing (will be refined later)
+                    pixel_size_um = dx_mm * 1000.0 / 2084.0  # rough: mm * 1000 / image_width
+                    break
+    except:
+        pass
+    
+    master_grid = compute_final_position(master_grid, tree, pixel_size_um=pixel_size_um)
     
     # ADDITIONAL DEBUG: Show final position changes
     print(f"\nFinal position analysis:")
@@ -876,7 +1180,7 @@ def register_tiles_batched(
             large_x_shifts = np.abs(x_shifts) > 1000  # More than 1000 pixels
             large_y_shifts = np.abs(y_shifts) > 1000
             if large_x_shifts.any() or large_y_shifts.any():
-                print(f"  ⚠️  WARNING: Large position shifts detected!")
+                print(f"  WARNING: Large position shifts detected!")
                 print(f"    Tiles with large X shifts: {master_grid.index[large_x_shifts].tolist()}")
                 print(f"    Tiles with large Y shifts: {master_grid.index[large_y_shifts].tolist()}")
         
@@ -898,16 +1202,165 @@ def register_tiles_batched(
     
     return master_grid, prop_dict
 
-@dataclass
-class RowInfo:
-    """Information about a row of tiles.
+
+def register_tiles(
+    path: Union[str, Path],
+    mode: RegistrationMode = RegistrationMode.AUTO,
+    csv_path: Optional[Union[str, Path]] = None,
+    output_csv_path: Optional[Union[str, Path]] = None,
+    channel_pattern: Optional[str] = None,
+    overlap_diff_threshold: float = 10,
+    pou: float = 3,
+    ncc_threshold: float = 0.5,
+    edge_width: int = DEFAULT_EDGE_WIDTH,
+    z_slice_to_keep: Optional[int] = 0,
+    tensor_backend_engine: Optional[str] = None,
+    flatfield_corrections: Optional[Dict[int, np.ndarray]] = None,
+    registration_channel: int = 0
+) -> Union[Tuple[pd.DataFrame, dict], pd.DataFrame, Dict[int, pd.DataFrame]]:
+    """Unified entry point for tile registration.
     
-    Attributes:
-        center_y: Y-coordinate of the row center in mm
-        tile_indices: List of indices for tiles in this row
+    Args:
+        path: Path to directory or files
+        mode: Registration mode (SINGLE, AUTO, MULTI_TIMEPOINT)
+        csv_path: Path to coordinates CSV (for SINGLE/AUTO modes)
+        output_csv_path: Path to save output (for AUTO mode)
+        channel_pattern: Pattern to match image files
+        overlap_diff_threshold: Allowed difference from initial guess (%)
+        pou: Percent overlap uncertainty
+        ncc_threshold: Normalized cross correlation threshold
+        edge_width: Width of edge strips for correlation
+        z_slice_to_keep: Z-slice to use for registration
+        tensor_backend_engine: Preferred backend ('cupy', 'torch', 'numpy')
+        flatfield_corrections: Precomputed flatfield corrections
+        registration_channel: Channel to use for registration
+        
+    Returns:
+        Depends on mode:
+        - SINGLE: Tuple[pd.DataFrame, dict] (results, properties)
+        - AUTO: pd.DataFrame (updated coordinates)
+        - MULTI_TIMEPOINT: Dict[int, pd.DataFrame] (timepoint -> coordinates)
     """
-    center_y: float
-    tile_indices: List[int]
+    path = Path(path)
+    
+    if mode == RegistrationMode.SINGLE:
+        # Direct batched processing of provided files
+        if csv_path is None:
+            raise ValueError("csv_path required for SINGLE mode")
+        
+        coords_df = read_coordinates_csv(csv_path)
+        
+        # Get image files
+        if path.is_dir():
+            if channel_pattern is None:
+                channel_pattern = select_channel_pattern(path)
+            all_image_paths = sorted(path.glob(channel_pattern))
+        else:
+            all_image_paths = [path]
+        
+        # Auto-select best channel if registration_channel is default (0)
+        if registration_channel == 0 and len(all_image_paths) > 0:
+            # Check format to determine if channel selection is needed
+            is_ome_tiff = any(p.name.lower().endswith(('.ome.tif', '.ome.tiff')) for p in all_image_paths)
+            
+            if not is_ome_tiff:
+                # Individual files: Need to filter to best channel
+                from ..image_loaders import ChannelSource
+                
+                # Try to select best channel
+                try:
+                    best_channel = select_best_registration_channel(
+                        all_image_paths,
+                        coords_df,
+                        edge_width=edge_width,
+                        num_sample_fovs=3,
+                        fov_to_z_level=None
+                    )
+                    
+                    # Get sample FOV to discover channels
+                    sample_fov_info = parse_filename_fov_info(all_image_paths[0].name)
+                    if sample_fov_info:
+                        region = sample_fov_info.get('region', 'Unknown')
+                        fov = sample_fov_info['fov']
+                        z_level = sample_fov_info.get('z_level')
+                        
+                        # Discover channels
+                        descriptors = ChannelSource.discover(
+                            files=all_image_paths,
+                            region=region,
+                            fov=fov,
+                            z_level=z_level
+                        )
+                        
+                        if descriptors and best_channel < len(descriptors):
+                            # Get the channel name for the selected channel
+                            selected_channel_name = descriptors[best_channel].name
+                            
+                            # Filter files to only those matching the selected channel
+                            filtered_paths = []
+                            for p in all_image_paths:
+                                channel_name = ChannelSource._extract_channel_name(p.name)
+                                if channel_name == selected_channel_name:
+                                    filtered_paths.append(p)
+                            
+                            if filtered_paths:
+                                all_image_paths = filtered_paths
+                                logger.info(f"Filtered to {len(all_image_paths)} files for channel '{selected_channel_name}'")
+                                # Individual files use channel 0
+                                registration_channel = 0
+                except Exception as e:
+                    logger.warning(f"Channel selection failed: {e}. Using all files.")
+            else:
+                # OME-TIFF: Channel selection happens inside register_tiles_batched
+                pass
+        
+        return register_tiles_batched(
+            selected_tiff_paths=all_image_paths,
+            region_coords=coords_df,
+            edge_width=edge_width,
+            overlap_diff_threshold=overlap_diff_threshold,
+            pou=pou,
+            ncc_threshold=ncc_threshold,
+            z_slice_to_keep=z_slice_to_keep,
+            tensor_backend_engine=tensor_backend_engine,
+            flatfield_corrections=flatfield_corrections,
+            registration_channel=registration_channel
+        )
+    
+    elif mode == RegistrationMode.AUTO:
+        # Auto-detect and update coordinates
+        if csv_path is None or output_csv_path is None:
+            raise ValueError("csv_path and output_csv_path required for AUTO mode")
+        
+        return register_and_update_coordinates(
+            image_directory=path,
+            csv_path=csv_path,
+            output_csv_path=output_csv_path,
+            channel_pattern=channel_pattern,
+            overlap_diff_threshold=overlap_diff_threshold,
+            pou=pou,
+            ncc_threshold=ncc_threshold,
+            z_slice_for_registration=z_slice_to_keep,
+            edge_width=edge_width,
+            tensor_backend_engine=tensor_backend_engine,
+            flatfield_corrections=flatfield_corrections
+        )
+    
+    elif mode == RegistrationMode.MULTI_TIMEPOINT:
+        # Process multiple timepoints
+        return process_multiple_timepoints(
+            base_directory=path,
+            overlap_diff_threshold=overlap_diff_threshold,
+            pou=pou,
+            ncc_threshold=ncc_threshold,
+            edge_width=edge_width,
+            tensor_backend_engine=tensor_backend_engine,
+            flatfield_corrections=flatfield_corrections
+        )
+    
+    else:
+        raise ValueError(f"Unknown registration mode: {mode}")
+
 
 def extract_tile_indices(
     filenames: List[str],
@@ -919,7 +1372,7 @@ def extract_tile_indices(
     y_col_name: str = DEFAULT_Y_COL,
     ROW_TOL_FACTOR: float = 0.20,
     COL_TOL_FACTOR: float = 0.20
-) -> Tuple[List[int], List[int], Dict[str, int]]:
+) -> Tuple[List[int], List[int], Dict[str, int], Dict[int, int]]:
     """
     Map each filename to (row, col) based on stage coordinates.
     Handles rows of different length that are centred or truncated.
@@ -937,14 +1390,15 @@ def extract_tile_indices(
         COL_TOL_FACTOR: Tolerance factor for column clustering (percentage of X pitch).
 
     Returns:
-        A tuple: (row_assignments, col_assignments, fname_to_dfidx_map)
+        A tuple: (row_assignments, col_assignments, fname_to_dfidx_map, fov_to_z_level)
+        fov_to_z_level is a dict mapping FOV number to z-level index for OME-TIFF files
         - row_assignments: List of 0-indexed row numbers for each filename.
         - col_assignments: List of 0-indexed column numbers for each filename.
         - fname_to_dfidx_map: Dictionary mapping filename to its original index in coords_df.
     """
     if not filenames:
         logger.info("Received empty filenames list, returning empty results.")
-        return [], [], {}
+        return [], [], {}, {}
 
     # --- Validate DataFrame columns ---
     required_cols = [fov_col_name, x_col_name, y_col_name]
@@ -955,6 +1409,32 @@ def extract_tile_indices(
             raise KeyError(msg)
 
     # 1.  Collect (x, y) per filename
+    # 0. PRE-CALCULATE z-level mapping for OME-TIFFs (before coordinate extraction)
+    fov_to_z_level: Dict[int, int] = {}
+    if 'z (um)' in coords_df.columns and 'z_level' in coords_df.columns:
+        is_ome_tiff = any(fn.lower().endswith('.ome.tiff') or fn.lower().endswith('.ome.tif') 
+                         for fn in filenames)
+        if is_ome_tiff:
+            # Get all FOVs from filenames
+            fovs_in_use = set()
+            for fname in filenames:
+                fov_info = parse_filename_fov_info(fname)
+                if fov_info and 'fov' in fov_info:
+                    fovs_in_use.add(fov_info['fov'])
+            
+            # Force selection of middle z-layer by index for all FOVs
+            print("Using index-based middle z-layer selection for registration")
+            logger.info("Using index-based middle z-layer selection for registration")
+            for fov in sorted(fovs_in_use):
+                fov_rows = coords_df[coords_df[fov_col_name].astype(int) == fov].sort_values('z_level')
+                if len(fov_rows) > 0:
+                    middle_idx = len(fov_rows) // 2
+                    z_level_to_use = fov_rows.iloc[middle_idx]['z_level']
+                    z_position = fov_rows.iloc[middle_idx]['z (um)']
+                    fov_to_z_level[fov] = int(z_level_to_use)
+                    print(f"  → FOV {fov}: using middle z_level={z_level_to_use} (index {middle_idx}/{len(fov_rows)}, z={z_position:.2f}µm)")
+                    logger.info(f"  → FOV {fov}: using middle z_level={z_level_to_use} (index {middle_idx}/{len(fov_rows)}, z={z_position:.2f}µm)")
+
     xy_coords: List[Tuple[float, float]] = []
     fname_to_dfidx_map: Dict[str, int] = {}
     valid_indices_in_filenames = []
@@ -1008,28 +1488,29 @@ def extract_tile_indices(
             logger.warning(f"FOV {fov} (from {fname}) not in coordinates DataFrame. Skipping this file.")
             continue
         if len(df_row) > 1:
-            logger.warning(f"FOV {fov} (from {fname}) has multiple entries. Using the first one that matches the z-level if possible.")
-            
-            # Try to find an entry that also matches the z-level from the filename
-            # For multi-page TIFFs, skip z-level refinement and let GUI/parameters control z-selection
-            z_level_fname = None
-            if fov_info and 'z_level' in fov_info:
-                z_level_fname = fov_info['z_level']
+            # Try to find an entry that matches the pre-calculated z-level (for OME-TIFFs)
+            z_level_to_use = None
+            if fov in fov_to_z_level:
+                z_level_to_use = fov_to_z_level[fov]
+                logger.debug(f"FOV {fov}: using pre-calculated z_level={z_level_to_use} for coordinate extraction")
+            # Otherwise try z-level from filename (for multi-page TIFFs)
+            elif fov_info and 'z_level' in fov_info:
+                z_level_to_use = fov_info['z_level']
             elif m and 'z_level' in m.groupdict():
                 try:
-                    z_level_fname = int(m.group('z_level'))
+                    z_level_to_use = int(m.group('z_level'))
                 except ValueError:
                     logger.warning(f"Could not parse z_level from filename {fname}.")
             
-            if z_level_fname is not None and 'z_level' in coords_df.columns:
-                matching_z_rows = df_row[df_row['z_level'].astype(int) == z_level_fname]
+            if z_level_to_use is not None and 'z_level' in coords_df.columns:
+                matching_z_rows = df_row[df_row['z_level'].astype(int) == z_level_to_use]
                 if not matching_z_rows.empty:
                     df_row = matching_z_rows
-                    logger.info(f"Refined selection for FOV {fov} to include z_level {z_level_fname}.")
-            # For multi-page TIFFs (no z_level in filename), use first entry and let z-slice filtering handle selection
+                else:
+                    logger.warning(f"FOV {fov}: z_level {z_level_to_use} not found in coords, using first entry")
             
             if len(df_row) > 1:
-                logger.warning(f"Still multiple entries for FOV {fov}. Using the first.")
+                logger.warning(f"FOV {fov}: Still multiple entries after z-level filtering. Using first.")
 
         idx = df_row.index[0]
         fname_to_dfidx_map[fname] = idx
@@ -1045,8 +1526,9 @@ def extract_tile_indices(
     if not xy_coords:
         logger.warning("No valid coordinates could be extracted. Returning empty results.")
         num_original_files = len(filenames)
-        return [-1] * num_original_files, [-1] * num_original_files, fname_to_dfidx_map
+        return [-1] * num_original_files, [-1] * num_original_files, fname_to_dfidx_map, {}
 
+    # fov_to_z_level already calculated at line 1225 (before coordinate extraction)
     x_arr, y_arr = map(np.asarray, zip(*xy_coords))
 
     # Initialize full assignment arrays with -1 (unassigned)
@@ -1114,7 +1596,7 @@ def extract_tile_indices(
 
     logger.info(f"Processed {len(xy_coords)}/{len(filenames)} files. Found {len(processed_rows)} rows and {len(col_centers_list)} columns.")
     
-    return final_row_assignments.tolist(), final_col_assignments.tolist(), fname_to_dfidx_map
+    return final_row_assignments.tolist(), final_col_assignments.tolist(), fname_to_dfidx_map, fov_to_z_level
 
 
 
@@ -1247,15 +1729,67 @@ def calculate_pixel_size_microns(
         raise ValueError("Could not calculate pixel size - no valid tile pairs found")
 
 
-def update_stage_coordinates(
+def update_coordinates(
     grid: pd.DataFrame,
     coords_df: pd.DataFrame,
     filename_to_index: Dict[str, int],
     filenames: List[str],
     pixel_size_um: float,
-    reference_idx: int = 0
+    reference_idx: int = 0,
+    full_coords_df: Optional[pd.DataFrame] = None,
+    region: Optional[str] = None
 ) -> pd.DataFrame:
-    """Update stage coordinates based on registration results.
+    """Unified coordinate update function for single and multi-z workflows.
+    
+    Replaces update_stage_coordinates and update_stage_coordinates_multi_z.
+    
+    Parameters
+    ----------
+    grid : pd.DataFrame
+        Registration results with pixel positions
+    coords_df : pd.DataFrame
+        Original coordinates to update (region-specific or full)
+    filename_to_index : Dict[str, int]
+        Mapping from filename to coordinate index
+    filenames : List[str]
+        Ordered list of filenames
+    pixel_size_um : float
+        Pixel size in microns
+    reference_idx : int
+        Index of reference tile (default 0)
+    full_coords_df : Optional[pd.DataFrame]
+        Full coordinates DataFrame for multi-region processing (optional)
+    region : Optional[str]
+        Current region being processed (optional, for multi-region)
+        
+    Returns
+    -------
+    updated_coords : pd.DataFrame
+        Updated coordinates with new stage positions
+    """
+    # Multi-region mode: work with full DataFrame
+    if full_coords_df is not None and region is not None:
+        return _update_coords_multi_region(
+            grid, coords_df, filename_to_index, filenames, 
+            pixel_size_um, full_coords_df, region, reference_idx
+        )
+    
+    # Single region mode: work with provided DataFrame
+    return _update_coords_single_region(
+        grid, coords_df, filename_to_index, filenames,
+        pixel_size_um, reference_idx
+    )
+
+
+def _update_coords_single_region(
+    grid: pd.DataFrame,
+    coords_df: pd.DataFrame,
+    filename_to_index: Dict[str, int],
+    filenames: List[str],
+    pixel_size_um: float,
+    reference_idx: int
+) -> pd.DataFrame:
+    """Update coordinates for single region (internal helper).
     
     Parameters
     ----------
@@ -1350,6 +1884,76 @@ def update_stage_coordinates(
     return updated_coords
 
 
+def _update_coords_multi_region(
+    grid: pd.DataFrame,
+    coords_df: pd.DataFrame,
+    filename_to_index: Dict[str, int],
+    filenames: List[str],
+    pixel_size_um: float,
+    full_coords_df: pd.DataFrame,
+    region: str,
+    reference_idx: int
+) -> pd.DataFrame:
+    """Update coordinates for multi-region processing (internal helper)."""
+    updated_coords = full_coords_df.copy()
+    
+    # Get reference position
+    ref_coord_idx = filename_to_index[filenames[reference_idx]]
+    ref_x_mm = coords_df.loc[ref_coord_idx, 'x (mm)']
+    ref_y_mm = coords_df.loc[ref_coord_idx, 'y (mm)']
+    ref_x_px = grid.loc[reference_idx, 'x_pos']
+    ref_y_px = grid.loc[reference_idx, 'y_pos']
+    
+    # Get FOV column name
+    fov_col_name = DEFAULT_FOV_COL
+    if fov_col_name not in coords_df.columns:
+        potential_fov_cols = [col for col in coords_df.columns if 'fov' in col.lower()]
+        if potential_fov_cols:
+            fov_col_name = potential_fov_cols[0]
+    
+    # Process each registered tile
+    for idx, row in grid.iterrows():
+        filename = filenames[idx]
+        coord_idx = filename_to_index[filename]
+        fov = coords_df.loc[coord_idx, fov_col_name]
+        
+        # Calculate position update
+        delta_x_px = row['x_pos'] - ref_x_px
+        delta_y_px = row['y_pos'] - ref_y_px
+        delta_x_mm = (delta_x_px * pixel_size_um) / 1000.0
+        delta_y_mm = (delta_y_px * pixel_size_um) / 1000.0
+        
+        new_x_mm = ref_x_mm + delta_x_mm
+        new_y_mm = ref_y_mm + delta_y_mm
+        
+        # Update all z-slices for this FOV in the same region
+        mask = (updated_coords['region'] == region) & (updated_coords[fov_col_name] == fov)
+        updated_coords.loc[mask, 'x (mm)'] = new_x_mm
+        updated_coords.loc[mask, 'y (mm)'] = new_y_mm
+        updated_coords.loc[mask, 'x_pos_px'] = row['x_pos']
+        updated_coords.loc[mask, 'y_pos_px'] = row['y_pos']
+    
+    return updated_coords
+
+
+def update_stage_coordinates(
+    grid: pd.DataFrame,
+    coords_df: pd.DataFrame,
+    filename_to_index: Dict[str, int],
+    filenames: List[str],
+    pixel_size_um: float,
+    reference_idx: int = 0
+) -> pd.DataFrame:
+    """[DEPRECATED] Use update_coordinates() instead.
+    
+    Legacy function for backward compatibility.
+    """
+    return update_coordinates(
+        grid, coords_df, filename_to_index, filenames,
+        pixel_size_um, reference_idx
+    )
+
+
 def read_coordinates_csv(csv_path: Union[str, Path]) -> pd.DataFrame:
     """Read coordinates from CSV file.
     
@@ -1365,6 +1969,30 @@ def read_coordinates_csv(csv_path: Union[str, Path]) -> pd.DataFrame:
     """
     return pd.read_csv(csv_path)
 
+
+def get_coordinates_path(image_directory: Path, timepoint: str = "0") -> Path:
+    """Get coordinates file path, preferring registered over original.
+    
+    Parameters
+    ----------
+    image_directory : Path
+        Root directory containing image data
+    timepoint : str
+        Timepoint identifier (default: "0")
+        
+    Returns
+    -------
+    Path
+        Path to coordinates file (registered if available, else original)
+    """
+    # Priority 1: registered coordinates
+    registered = image_directory / "registered_coordinates" / f"{timepoint}_coordinates.csv"
+    if registered.exists():
+        return registered
+    
+    # Priority 2: original coordinates in timepoint folder
+    return image_directory / timepoint / "coordinates.csv"
+
 def read_tiff_images_for_region(
     directory: Union[str, Path], 
     pattern: str,
@@ -1374,10 +2002,12 @@ def read_tiff_images_for_region(
 ) -> Dict[str, np.ndarray]:
     """Read TIFF images from directory for a specific region.
     
+    Checks both the given directory and parent's ome_tiff/ subdirectory.
+    
     Parameters
     ----------
     directory : Union[str, Path]
-        Directory containing TIFF images
+        Directory containing TIFF images (typically a timepoint directory like '0/')
     pattern : str
         Glob pattern to match TIFF files
     region : str
@@ -1395,10 +2025,18 @@ def read_tiff_images_for_region(
     directory = Path(directory)
     images = {}
     
+    # Check for new OME-TIFF structure first
+    parent_ome_dir = directory.parent / "ome_tiff"
+    if parent_ome_dir.exists() and parent_ome_dir.is_dir():
+        search_dir = parent_ome_dir
+        logger.info(f"Reading images from ome_tiff/ directory: {search_dir}")
+    else:
+        search_dir = directory
+    
     # Get all matching files
-    all_tiff_paths = list(directory.glob(pattern))
+    all_tiff_paths = list(search_dir.glob(pattern))
     if not all_tiff_paths:
-        print(f"No files matching pattern '{pattern}' found in {directory}")
+        print(f"No files matching pattern '{pattern}' found in {search_dir}")
         return images
     
     # Filter for the specific region
@@ -1422,12 +2060,21 @@ def read_tiff_images_for_region(
             if fov_info:
                 try:
                     fov = fov_info['fov']
-                    # For multi-page TIFFs, z_level is not in filename
-                    if 'z_level' in fov_info:
+                    
+                    # Check if this is an OME-TIFF or multi-page TIFF
+                    is_ome_tiff = path.name.lower().endswith('.ome.tif') or path.name.lower().endswith('.ome.tiff')
+                    is_multipage = '_stack' in path.name.lower()
+                    
+                    if is_ome_tiff or is_multipage:
+                        # For OME-TIFF and multi-page TIFF, z-selection happens during loading
+                        # Just use the target z_slice_to_keep as a placeholder
+                        z_level = z_slice_to_keep if z_slice_to_keep is not None else 0
+                    elif 'z_level' in fov_info:
+                        # Regular TIFF with z_level in filename
                         z_level = fov_info['z_level']
                     else:
-                        # Multi-page TIFF: use z_slice_to_keep as the target z-level
-                        z_level = z_slice_to_keep if z_slice_to_keep is not None else 0
+                        # Shouldn't happen, but default to 0
+                        z_level = 0
                     
                     if fov not in fov_to_files_map:
                         fov_to_files_map[fov] = []
@@ -1467,7 +2114,7 @@ def read_tiff_images_for_region(
     # Load images in parallel
     with Pool(processes=n_processes) as pool:
         results = list(tqdm(
-            pool.imap(load_single_image, selected_tiff_paths),
+            pool.imap(_load_image_wrapper, selected_tiff_paths),
             total=len(selected_tiff_paths),
             desc=f"Loading images for region {region}"
         ))
@@ -1481,16 +2128,70 @@ def read_tiff_images_for_region(
 
 
 
-def load_single_image(path: Path) -> Tuple[str, Optional[np.ndarray]]:
-    """Load a single image with error handling.
+def apply_flatfield_to_image(
+    image: np.ndarray, 
+    flatfield: np.ndarray, 
+    dtype: Optional[np.dtype] = None
+) -> np.ndarray:
+    """Apply flatfield correction to a single image.
     
-    For multi-page TIFF files (containing "_stack" in name), extracts the middle z-slice
-    to match the default stitching behavior.
+    Parameters
+    ----------
+    image : np.ndarray
+        Input image to correct
+    flatfield : np.ndarray
+        Flatfield correction array (same shape as image)
+    dtype : Optional[np.dtype]
+        Output dtype, defaults to input dtype
+        
+    Returns
+    -------
+    np.ndarray
+        Flatfield-corrected image
+        
+    Raises
+    ------
+    ValueError
+        If flatfield shape doesn't match image shape
+    """
+    if dtype is None:
+        dtype = image.dtype
+    
+    # Validate shapes match
+    if image.shape != flatfield.shape:
+        raise ValueError(
+            f"Flatfield shape {flatfield.shape} doesn't match image shape {image.shape}"
+        )
+    
+    corrected = (image / flatfield).clip(
+        min=np.iinfo(dtype).min if np.issubdtype(dtype, np.integer) else 0,
+        max=np.iinfo(dtype).max if np.issubdtype(dtype, np.integer) else 1
+    ).astype(dtype)
+    return corrected
+
+
+def load_single_image(
+    path: Path, 
+    flatfield: Optional[np.ndarray] = None,
+    fov_to_z_level: Optional[Dict[int, int]] = None,
+    channel: int = 0
+) -> Tuple[str, Optional[np.ndarray]]:
+    """Load a single image with error handling and optional flatfield correction.
+    
+    Handles regular TIFF, multi-page TIFF, and OME-TIFF files.
+    For multi-page TIFF files (containing "_stack" in name), extracts the middle z-slice.
+    For OME-TIFF files, extracts specified z-slice and channel, or uses z-position override.
     
     Parameters
     ----------
     path : Path
         Path to the TIFF file
+    flatfield : Optional[np.ndarray]
+        Flatfield correction to apply (same shape as image)
+    fov_to_z_level : Optional[Dict[int, int]]
+        Mapping of FOV number to z-level index for OME-TIFF z-position matching
+    channel : int
+        Channel index to load for multi-channel images (default 0)
         
     Returns
     -------
@@ -1498,8 +2199,47 @@ def load_single_image(path: Path) -> Tuple[str, Optional[np.ndarray]]:
         Tuple of (filename, image_array) or (filename, None) if loading failed
     """
     try:
+        image = None
+        
+        # Check if this is an OME-TIFF file
+        if path.name.lower().endswith('.ome.tif') or path.name.lower().endswith('.ome.tiff'):
+            # Use the image loader for OME-TIFF
+            try:
+                from ..image_loaders import create_image_loader
+                loader = create_image_loader(path, format_hint='ome_tiff')
+                meta = loader.metadata
+                
+                # Use specified channel, determine z-slice
+                channel_idx = channel
+                z_idx = meta['num_z'] // 2 if meta['num_z'] > 1 else 0
+                
+                # Check if there's a z-position-aware override
+                if fov_to_z_level:
+                    fov_info = parse_filename_fov_info(path.name)
+                    if fov_info and 'fov' in fov_info and fov_info['fov'] in fov_to_z_level:
+                        z_idx = fov_to_z_level[fov_info['fov']]
+                        logger.debug(f"Loading {path.name}: using z-override z_level={z_idx} for FOV {fov_info['fov']}")
+                
+                image = loader.read_slice(channel=channel_idx, z=z_idx)
+                logger.debug(f"Loaded OME-TIFF {path.name}: channel {channel_idx}, z-slice {z_idx}/{meta['num_z']}")
+            except Exception as e:
+                logger.warning(f"Failed to load OME-TIFF with image_loaders, trying tifffile fallback: {e}")
+                # Fallback to tifffile with explicit middle z-slice selection
+                try:
+                    with tifffile.TiffFile(path) as tif:
+                        num_pages = len(tif.pages)
+                        if num_pages > 1:
+                            middle_z = num_pages // 2
+                            image = tif.pages[middle_z].asarray()
+                            logger.info(f"OME-TIFF fallback: loaded z-slice {middle_z}/{num_pages} from {path.name}")
+                        else:
+                            image = tif.pages[0].asarray()
+                except Exception as fallback_error:
+                    logger.error(f"OME-TIFF fallback also failed for {path.name}: {fallback_error}")
+                    image = None
+        
         # Check if this is a multi-page TIFF
-        if "_stack" in path.name:
+        if image is None and "_stack" in path.name:
             # Multi-page TIFF: extract middle z-slice to match stitching behavior
             with tifffile.TiffFile(path) as tif:
                 num_pages = len(tif.pages)
@@ -1508,13 +2248,18 @@ def load_single_image(path: Path) -> Tuple[str, Optional[np.ndarray]]:
                     middle_z = num_pages // 2
                     image = tif.pages[middle_z].asarray()
                     logger.debug(f"Loaded middle z-slice {middle_z} from {path.name} ({num_pages} total slices)")
-                    return path.name, image
                 else:
                     # Single page, load normally
-                    return path.name, tif.pages[0].asarray()
-        else:
+                    image = tif.pages[0].asarray()
+        elif image is None:
             # Regular TIFF file
-            return path.name, tifffile.imread(str(path))
+            image = tifffile.imread(str(path))
+        
+        # Apply flatfield correction if provided
+        if image is not None and flatfield is not None:
+            image = apply_flatfield_to_image(image, flatfield, dtype=image.dtype)
+            
+        return path.name, image
     except MemoryError:
         logger.error(f"MemoryError reading {path}. File might be too large or corrupt.")
         return path.name, None
@@ -1570,79 +2315,21 @@ def update_stage_coordinates_multi_z(
     region: str,
     reference_idx: int = 0
 ) -> pd.DataFrame:
-    """Update stage coordinates for all z-slices based on registration results.
+    """[DEPRECATED] Use update_coordinates() instead.
     
-    Parameters
-    ----------
-    grid : pd.DataFrame
-        Registration results with pixel positions
-    coords_df : pd.DataFrame
-        Region-specific coordinates to update
-    filename_to_index : Dict[str, int]
-        Mapping from filename to coordinate index
-    filenames : List[str]
-        Ordered list of filenames
-    pixel_size_um : float
-        Pixel size in microns
-    full_coords_df : pd.DataFrame
-        Full coordinates DataFrame (all regions)
-    region : str
-        Current region being processed
-    reference_idx : int
-        Index of reference tile (default 0)
-        
-    Returns
-    -------
-    updated_coords : pd.DataFrame
-        Updated coordinates with new stage positions
+    Legacy function for backward compatibility with multi-z workflows.
     """
-    # Work with the full dataframe to update all z-slices
-    updated_coords = full_coords_df.copy()
-    
-    # Get reference position
-    ref_coord_idx = filename_to_index[filenames[reference_idx]]
-    ref_x_mm = coords_df.loc[ref_coord_idx, 'x (mm)']
-    ref_y_mm = coords_df.loc[ref_coord_idx, 'y (mm)']
-    ref_x_px = grid.loc[reference_idx, 'x_pos']
-    ref_y_px = grid.loc[reference_idx, 'y_pos']
-    
-    # Get FOV column name
-    fov_col_name = DEFAULT_FOV_COL
-    if fov_col_name not in coords_df.columns:
-        potential_fov_cols = [col for col in coords_df.columns if 'fov' in col.lower()]
-        if potential_fov_cols:
-            fov_col_name = potential_fov_cols[0]
-            logger.info(f"Using '{fov_col_name}' as FOV column.")
-    
-    # Process each registered tile
-    for idx, row in grid.iterrows():
-        filename = filenames[idx]
-        coord_idx = filename_to_index[filename]
-        
-        # Get the FOV from this coordinate
-        fov = coords_df.loc[coord_idx, fov_col_name]
-        
-        # Calculate the position update
-        delta_x_px = row['x_pos'] - ref_x_px
-        delta_y_px = row['y_pos'] - ref_y_px
-        delta_x_mm = (delta_x_px * pixel_size_um) / 1000.0
-        delta_y_mm = (delta_y_px * pixel_size_um) / 1000.0
-        
-        new_x_mm = ref_x_mm + delta_x_mm
-        new_y_mm = ref_y_mm + delta_y_mm
-        
-        # Update all z-slices for this FOV in the same region
-        mask = (updated_coords['region'] == region) & (updated_coords[fov_col_name] == fov)
-        updated_coords.loc[mask, 'x (mm)'] = new_x_mm
-        updated_coords.loc[mask, 'y (mm)'] = new_y_mm
-        updated_coords.loc[mask, 'x_pos_px'] = row['x_pos']
-        updated_coords.loc[mask, 'y_pos_px'] = row['y_pos']
-    
-    return updated_coords
+    return update_coordinates(
+        grid, coords_df, filename_to_index, filenames,
+        pixel_size_um, reference_idx, full_coords_df, region
+    )
 
 
 def detect_channels(directory: Union[str, Path]) -> Dict[str, List[Path]]:
     """Detect available channels in the directory.
+    
+    Checks both the given directory and parent's ome_tiff/ subdirectory.
+    For OME-TIFF files, reads internal channel metadata.
     
     Parameters
     ----------
@@ -1652,18 +2339,62 @@ def detect_channels(directory: Union[str, Path]) -> Dict[str, List[Path]]:
     Returns
     -------
     Dict[str, List[Path]]
-        Dictionary mapping channel type to list of file paths
+        Dictionary mapping channel type to list of file paths or channel info
     """
     directory = Path(directory)
-    tiff_files = list(directory.glob("*.tiff"))
+    
+    # Check for new OME-TIFF structure first
+    parent_ome_dir = directory.parent / "ome_tiff"
+    if parent_ome_dir.exists() and parent_ome_dir.is_dir():
+        tiff_files = list(parent_ome_dir.glob("*.tiff")) + list(parent_ome_dir.glob("*.tif"))
+    else:
+        tiff_files = list(directory.glob("*.tiff")) + list(directory.glob("*.tif"))
     
     # Channel categories
     channels = {
         "fluorescence": [],
-        "brightfield": []
+        "brightfield": [],
+        "ome_tiff_channels": {}  # Maps channel names to (file, channel_idx)
     }
     
-    # Regular expressions for channel detection
+    # Check if we have OME-TIFF files
+    ome_tiff_files = [f for f in tiff_files if '.ome.' in f.name.lower()]
+    if ome_tiff_files:
+        # Read channel info from first OME-TIFF file
+        try:
+            from ..image_loaders import create_image_loader
+            loader = create_image_loader(ome_tiff_files[0], format_hint='ome_tiff')
+            meta = loader.metadata
+            num_channels = meta['num_channels']
+            channel_names = meta.get('channel_names') or [f"channel_{i}" for i in range(num_channels)]
+            
+            logger.info(f"OME-TIFF: detected {num_channels} channels in {ome_tiff_files[0].name}: {channel_names}")
+            
+            # Categorize channels by name
+            fluor_patterns = [r"Fluorescence", r"\d+ nm", r"GFP", r"RFP", r"DAPI", r"Cy\d"]
+            bf_patterns = [r"^BF$", r"brightfield", r"bright.?field", r"phase"]
+            
+            for idx, ch_name in enumerate(channel_names):
+                is_fluor = any(re.search(pattern, ch_name, re.IGNORECASE) for pattern in fluor_patterns)
+                is_bf = any(re.search(pattern, ch_name, re.IGNORECASE) for pattern in bf_patterns)
+                
+                # Store channel info with file path and index
+                channels["ome_tiff_channels"][ch_name] = (ome_tiff_files[0], idx)
+                
+                if is_fluor:
+                    channels["fluorescence"].append((ome_tiff_files[0], idx, ch_name))
+                elif is_bf:
+                    channels["brightfield"].append((ome_tiff_files[0], idx, ch_name))
+                else:
+                    # Default to fluorescence if unclear
+                    channels["fluorescence"].append((ome_tiff_files[0], idx, ch_name))
+            
+            return channels
+        except Exception as e:
+            logger.warning(f"Failed to read OME-TIFF channel metadata: {e}")
+            # Fall through to filename-based detection
+    
+    # Regular expressions for channel detection (for non-OME-TIFF files)
     fluor_patterns = [
         r"(\d+)_nm_Ex\.tiff$",  # Matches wavelength patterns like 405_nm_Ex.tiff
         r"Fluorescence",  # Generic fluorescence indicator
@@ -1692,56 +2423,57 @@ def detect_channels(directory: Union[str, Path]) -> Dict[str, List[Path]]:
     return channels
 
 def select_channel_pattern(directory: Union[str, Path]) -> str:
-    """Automatically select an appropriate channel pattern.
+    """Select file pattern based on image format (not channel-specific).
+    
+    Returns a glob pattern that matches the image format in the directory.
+    Channel selection happens downstream via variance analysis in 
+    select_best_registration_channel().
     
     Parameters
     ----------
     directory : Union[str, Path]
-        Directory containing TIFF images
+        Directory containing TIFF images (typically a timepoint directory like '0/')
         
     Returns
     -------
     str
-        Glob pattern for the selected channel
+        Glob pattern like "*.ome.tiff", "*.tiff", etc. (format-only, not channel-specific)
     """
-    channels = detect_channels(directory)
+    directory = Path(directory)
     
-    # Prefer fluorescence channels if available
-    if channels["fluorescence"]:
-        # Group fluorescence files by wavelength
-        wavelengths = {}
-        for file in channels["fluorescence"]:
-            match = re.search(r"(\d+)_nm_Ex\.tiff$", file.name)
-            if match:
-                wavelength = int(match.group(1))
-                if wavelength not in wavelengths:
-                    wavelengths[wavelength] = []
-                wavelengths[wavelength].append(file)
-        
-        if wavelengths:
-            # Select the shortest wavelength (typically best for registration)
-            wavelength = min(wavelengths.keys())
-            pattern = f"*{wavelength}_nm_Ex.tiff"
-            print(f"Selected fluorescence channel: {pattern}")
-            return pattern
-        
-        # If no wavelength pattern found, use the first fluorescence file pattern
-        example_file = channels["fluorescence"][0].name
-        pattern = f"*{example_file.split('_Fluorescence_')[-1]}"
-        print(f"Selected fluorescence channel: {pattern}")
-        return pattern
+    # Determine which directory to check for files
+    parent_ome_dir = directory.parent / "ome_tiff"
+    if parent_ome_dir.exists() and parent_ome_dir.is_dir():
+        search_dir = parent_ome_dir
+        logger.info(f"Detected ome_tiff/ directory, using {search_dir} for file detection")
+    else:
+        search_dir = directory
     
-    # Fall back to brightfield if available
-    if channels["brightfield"]:
-        example_file = channels["brightfield"][0].name
-        if len(channels["brightfield"]) > 1:
-            print("Warning: Multiple brightfield files found, using first one as pattern")
-        pattern = f"*{example_file.split('_BF_')[-1]}"
-        print(f"Selected brightfield channel: {pattern}")
-        return pattern
+    # Check for OME-TIFF files first (most specific format)
+    ome_tiff_files = list(search_dir.glob("*.ome.tiff")) + list(search_dir.glob("*.ome.tif"))
+    if ome_tiff_files:
+        # Check which extension is actually used (.tif vs .tiff)
+        example_file = ome_tiff_files[0].name
+        if example_file.lower().endswith('.ome.tiff'):
+            logger.info("Detected OME-TIFF format with .ome.tiff extension")
+            return "*.ome.tiff"
+        else:
+            logger.info("Detected OME-TIFF format with .ome.tif extension")
+            return "*.ome.tif"
     
-    # If no specific patterns found, use all TIFF files
-    print("Warning: No specific channel pattern detected, using all TIFF files")
+    # Check for regular TIFF files
+    tiff_files = list(search_dir.glob("*.tiff"))
+    tif_files = list(search_dir.glob("*.tif"))
+    
+    if tiff_files:
+        logger.info("Detected regular TIFF format with .tiff extension")
+        return "*.tiff"
+    elif tif_files:
+        logger.info("Detected regular TIFF format with .tif extension")
+        return "*.tif"
+    
+    # Default fallback
+    logger.warning("No TIFF files found, defaulting to *.tiff pattern")
     return "*.tiff"
 
 
@@ -1793,14 +2525,13 @@ def _compute_direction_translations(args):
         
         yins_edge, xins_edge, _ = multi_peak_max(PCM_on_edges)
         
-        # interpret_translation works with edges and edge-based limits,
-        # returns (ncc_val, y_best_edge_relative, x_best_edge_relative)
-        ncc_val, y_best_edge_relative, x_best_edge_relative = interpret_translation_ransac(
+        # Compute translation with RANSAC strategy (includes subpixel + optimization)
+        ncc_val, y_best_edge_relative, x_best_edge_relative = compute_translation(
             edge1, edge2, yins_edge, xins_edge, *lims_edge_relative[0], *lims_edge_relative[1],
-            n=10,  # More candidates for RANSAC
+            strategy=TranslationStrategy.RANSAC,
+            n=10,
             ransac_config=RANSACConfig(use_ransac=True, residual_threshold=2.0, min_inlier_ratio=0.3),
             subpixel_config=SubpixelConfig(upsample_factor=100, use_subpixel=True),
-            use_continuous_optimization=True,
             optimization_config=OptimizationConfig(method='trf', max_nfev=50, verbose=0)
         )
         
@@ -1836,12 +2567,14 @@ def register_and_update_coordinates(
     overlap_diff_threshold: float = 10,
     pou: float = 3,
     ncc_threshold: float = 0.5,
-    skip_backup: bool = False,
     z_slice_for_registration: Optional[int] = 0,
     edge_width: int = DEFAULT_EDGE_WIDTH,
-    tensor_backend_engine: Optional[str] = None
+    tensor_backend_engine: Optional[str] = None,
+    flatfield_corrections: Optional[Dict[int, np.ndarray]] = None
 ) -> pd.DataFrame:
-    """Register tiles and update stage coordinates for all regions.
+    """[DEPRECATED] Use register_tiles(mode=RegistrationMode.AUTO) instead.
+    
+    Register tiles and update stage coordinates for all regions.
     
     Parameters
     ----------
@@ -1859,14 +2592,14 @@ def register_and_update_coordinates(
         Percent overlap uncertainty
     ncc_threshold : float
         Normalized cross correlation threshold
-    skip_backup : bool
-        Whether to skip creating a backup of the coordinates file
     z_slice_for_registration : Optional[int]
         Which z-slice to use for registration (default: 0)
     edge_width : int
         Width of the edge strips (in pixels) to use for registration
     tensor_backend_engine : Optional[str]
         Preferred tensor backend engine ('cupy', 'torch', 'numpy', None for auto)
+    flatfield_corrections : Optional[Dict[int, np.ndarray]]
+        Precomputed flatfield corrections indexed by channel
         
     Returns
     -------
@@ -1875,28 +2608,19 @@ def register_and_update_coordinates(
     """
     image_directory = Path(image_directory)
     csv_path = Path(csv_path)
-    output_csv_path = Path(output_csv_path)
     
-    # Create original_coordinates directory if it doesn't exist
-    original_coords_dir = image_directory / "original_coordinates"
-    original_coords_dir.mkdir(exist_ok=True)
-    
-    # Initialize timepoint for backup filename (fixes the original bug)
-    timepoint = "unknown"
-    timepoint_dir = None  # Initialize for later use
-    
-    # Look for coordinates.csv in the timepoint directory
+    # Detect timepoint
+    timepoint = "0"
     timepoint_dir = image_directory / "0"
     if timepoint_dir.exists():
         coords_file = timepoint_dir / "coordinates.csv"
         if coords_file.exists():
             csv_path = coords_file
-            print(f"Found coordinates file at: {csv_path}")
-            # Get timepoint from the subdirectory name (e.g., "0" from the path)
             timepoint = timepoint_dir.name
+            print(f"Found coordinates file at: {csv_path}")
     
-    # Validate that the coordinates file actually exists
-    if not Path(csv_path).exists():
+    # Validate coordinates file exists
+    if not csv_path.exists():
         raise FileNotFoundError(
             f"Stage coordinates file not found.\n\n"
             f"Expected location: {csv_path}\n\n"
@@ -1907,13 +2631,6 @@ def register_and_update_coordinates(
         )
     
     print(f"Using coordinates file: {csv_path}")
-    
-    # Create backup of original coordinates
-    if not skip_backup:
-        backup_path = original_coords_dir / f"original_coordinates_{timepoint}.csv"
-        import shutil
-        shutil.copy2(csv_path, backup_path)
-        print(f"Created backup of original coordinates at: {backup_path}")
     
     # Read coordinates
     coords_df = read_coordinates_csv(csv_path)
@@ -1941,12 +2658,18 @@ def register_and_update_coordinates(
     
     # Auto-detect channel pattern if not provided
     if channel_pattern is None:
-        # Look in the 0 subdirectory for TIFF files
-        tiff_dir = image_directory / "0"
-        if tiff_dir.exists():
-            channel_pattern = select_channel_pattern(tiff_dir)
-        else:
-            channel_pattern = select_channel_pattern(image_directory)
+        try:
+            # Look in the 0 subdirectory for TIFF files
+            tiff_dir = image_directory / "0"
+            if tiff_dir.exists():
+                channel_pattern = select_channel_pattern(tiff_dir)
+            else:
+                channel_pattern = select_channel_pattern(image_directory)
+        except Exception as e:
+            logging.error(f"Failed to auto-detect channel pattern: {e}")
+            # Fallback to generic TIFF pattern
+            channel_pattern = "*.tiff"
+            logging.warning(f"Using fallback channel pattern: {channel_pattern}")
     
     # Initialize the updated coordinates with a copy
     updated_coords = coords_df.copy()
@@ -1955,6 +2678,10 @@ def register_and_update_coordinates(
     regions = coords_df['region'].unique()
     print(f"Found {len(regions)} regions to process: {regions}")
     
+    # Track failed regions
+    failed_regions = []
+    successful_regions = []
+    
     for region in regions:
         print(f"\nProcessing region: {region}")
         
@@ -1962,12 +2689,18 @@ def register_and_update_coordinates(
         region_coords = coords_df[coords_df['region'] == region].copy()
         
         # Get image paths for this region only
-        # Look in the 0 subdirectory for TIFF files
-        tiff_dir = image_directory / "0"
-        if tiff_dir.exists():
-            selected_tiff_paths = list(tiff_dir.glob(channel_pattern))
+        # Check for new OME-TIFF structure first: ome_tiff/ directory
+        ome_tiff_dir = image_directory / "ome_tiff"
+        if ome_tiff_dir.exists() and ome_tiff_dir.is_dir():
+            selected_tiff_paths = list(ome_tiff_dir.glob(channel_pattern))
+            logger.info(f"Reading images from ome_tiff/ directory: {ome_tiff_dir}")
         else:
-            selected_tiff_paths = list(image_directory.glob(channel_pattern))
+            # Look in the 0 subdirectory for TIFF files (legacy structure)
+            tiff_dir = image_directory / "0"
+            if tiff_dir.exists():
+                selected_tiff_paths = list(tiff_dir.glob(channel_pattern))
+            else:
+                selected_tiff_paths = list(image_directory.glob(channel_pattern))
         
         # Filter for the specific region
         region_paths = []
@@ -1979,6 +2712,53 @@ def register_and_update_coordinates(
         if not region_paths:
             print(f"No images found for region {region}, skipping")
             continue
+        
+        # Auto-select best channel for individual files (BEFORE z-slice filtering)
+        is_ome_tiff = any(p.name.lower().endswith(('.ome.tif', '.ome.tiff')) for p in region_paths)
+        
+        if not is_ome_tiff and len(region_paths) > 0:
+            # Individual files: Need to filter to best channel
+            from ..image_loaders import ChannelSource
+            
+            try:
+                best_channel = select_best_registration_channel(
+                    region_paths,
+                    region_coords,
+                    edge_width=edge_width,
+                    num_sample_fovs=3,
+                    fov_to_z_level=None
+                )
+                
+                # Get sample FOV to discover channels
+                sample_fov_info = parse_filename_fov_info(region_paths[0].name)
+                if sample_fov_info:
+                    fov = sample_fov_info['fov']
+                    z_level = sample_fov_info.get('z_level')
+                    
+                    # Discover channels
+                    descriptors = ChannelSource.discover(
+                        files=region_paths,
+                        region=region,
+                        fov=fov,
+                        z_level=z_level
+                    )
+                    
+                    if descriptors and best_channel < len(descriptors):
+                        # Get the channel name for the selected channel
+                        selected_channel_name = descriptors[best_channel].name
+                        
+                        # Filter files to only those matching the selected channel
+                        filtered_paths = []
+                        for p in region_paths:
+                            channel_name = ChannelSource._extract_channel_name(p.name)
+                            if channel_name == selected_channel_name:
+                                filtered_paths.append(p)
+                        
+                        if filtered_paths:
+                            region_paths = filtered_paths
+                            logger.info(f"Region {region}: Filtered to {len(region_paths)} files for channel '{selected_channel_name}'")
+            except Exception as e:
+                logger.warning(f"Channel selection failed for region {region}: {e}. Using all files.")
         
         # Apply z-slice filtering to region-specific files
         if z_slice_for_registration is not None:
@@ -2031,7 +2811,7 @@ def register_and_update_coordinates(
         
         # Extract tile indices from filenames
         filenames = [p.name for p in selected_tiff_paths]
-        rows, cols, filename_to_index = extract_tile_indices(filenames, region_coords)
+        rows, cols, filename_to_index, fov_to_z_level = extract_tile_indices(filenames, region_coords)
         
         try:
             # Register tiles using batched processing
@@ -2043,7 +2823,9 @@ def register_and_update_coordinates(
                 pou=pou,
                 ncc_threshold=ncc_threshold,
                 z_slice_to_keep=z_slice_for_registration,
-                tensor_backend_engine=tensor_backend_engine
+                tensor_backend_engine=tensor_backend_engine,
+                flatfield_corrections=flatfield_corrections,
+                registration_channel=0
             )
             
             # Calculate pixel size
@@ -2068,15 +2850,17 @@ def register_and_update_coordinates(
             
             # Update the main dataframe with region results
             updated_coords.update(region_updated)
+            successful_regions.append(region)
             
         except Exception as e:
-            print(f"Error processing region {region}: {e}")
-        # Clean up memory after error
-        try:
-            backend = get_tensor_backend()
-            backend.cleanup_memory()
-        except:
-            pass
+            logging.error(f"Error processing region {region}: {e}")
+            failed_regions.append((region, str(e)))
+            # Clean up memory after error
+            try:
+                backend = get_tensor_backend()
+                backend.cleanup_memory()
+            except Exception:
+                pass
             continue
         
         # Force memory cleanup between regions
@@ -2086,9 +2870,31 @@ def register_and_update_coordinates(
         except:
             pass
     
-    # Save updated coordinates to the output path
-    updated_coords.to_csv(output_csv_path, index=False)
-    print(f"Saved updated coordinates to: {output_csv_path}")
+    # Report registration summary
+    print(f"\n=== Registration Summary ===")
+    print(f"Total regions: {len(regions)}")
+    print(f"Successful: {len(successful_regions)}")
+    print(f"Failed: {len(failed_regions)}")
+    
+    if failed_regions:
+        print(f"\nFailed regions:")
+        for region, error in failed_regions:
+            print(f"  - {region}: {error}")
+        
+        # Warn if too many failures
+        failure_rate = len(failed_regions) / len(regions)
+        if failure_rate > 0.5:
+            logging.warning(
+                f"High failure rate: {failure_rate:.1%} of regions failed. "
+                f"Check NCC threshold, image quality, or tile overlap."
+            )
+    
+    # Save registered coordinates to dedicated folder
+    registered_dir = image_directory / "registered_coordinates"
+    registered_dir.mkdir(exist_ok=True)
+    output_path = registered_dir / f"{timepoint}_coordinates.csv"
+    updated_coords.to_csv(output_path, index=False)
+    print(f"Saved registered coordinates to: {output_path}")
     
     return updated_coords
 
@@ -2099,9 +2905,13 @@ def process_multiple_timepoints(
     pou: float = 3,
     ncc_threshold: float = 0.5,
     edge_width: int = DEFAULT_EDGE_WIDTH,
-    tensor_backend_engine: Optional[str] = None
+    tensor_backend_engine: Optional[str] = None,
+    flatfield_corrections: Optional[Dict[int, np.ndarray]] = None,
+    register_once: bool = True
 ) -> Dict[int, pd.DataFrame]:
-    """Process multiple timepoints from a directory.
+    """[DEPRECATED] Use register_tiles(mode=RegistrationMode.MULTI_TIMEPOINT) instead.
+    
+    Process multiple timepoints from a directory.
     
     Parameters
     ----------
@@ -2117,6 +2927,11 @@ def process_multiple_timepoints(
         Width of the edge strips (in pixels) to use for registration
     tensor_backend_engine : Optional[str]
         Preferred tensor backend engine ('cupy', 'torch', 'numpy', None for auto)
+    flatfield_corrections : Optional[Dict[int, np.ndarray]]
+        Precomputed flatfield corrections indexed by channel
+    register_once : bool
+        If True, compute registration for first timepoint only and apply to all.
+        If False, compute registration independently for each timepoint.
         
     Returns
     -------
@@ -2127,10 +2942,6 @@ def process_multiple_timepoints(
     if not base_directory.is_dir():
         raise ValueError(f"Base directory does not exist: {base_directory}")
         
-    # Create original_coordinates directory
-    backup_dir = base_directory / "original_coordinates"
-    backup_dir.mkdir(exist_ok=True)
-        
     # Find all timepoint directories (numbered subdirectories)
     timepoint_dirs = sorted([d for d in base_directory.iterdir() if d.is_dir() and d.name.isdigit()])
     if not timepoint_dirs:
@@ -2140,39 +2951,60 @@ def process_multiple_timepoints(
     
     # Process each timepoint
     results = {}
-    for tp_dir in timepoint_dirs:
+    first_timepoint_deltas = None
+    
+    for i, tp_dir in enumerate(timepoint_dirs):
         timepoint = int(tp_dir.name)
         print(f"\nProcessing timepoint {timepoint}")
         
-        # Find coordinates.csv in timepoint directory
+        # Find coordinates.csv in timepoint directory (read-only source)
         tp_coords = list(tp_dir.glob("coordinates.csv"))
         if not tp_coords:
             print(f"Warning: No coordinates.csv found in timepoint {timepoint}, skipping")
             continue
         coords_csv = tp_coords[0]
         
-        # Create backup of this timepoint's coordinates
-        backup_path = backup_dir / f"original_coordinates_{timepoint}.csv"
-        if not backup_path.exists():
-            print(f"Creating backup of timepoint {timepoint} coordinates at {backup_path}")
-            import shutil
-            shutil.copy2(coords_csv, backup_path)
+        # Read original coordinates before registration (for delta computation)
+        original_coords = pd.read_csv(coords_csv)
             
         try:
-            # Process this timepoint
-            updated_coords = register_and_update_coordinates(
-                image_directory=base_directory,  # Use base directory instead of timepoint directory
-                csv_path=coords_csv,
-                output_csv_path=coords_csv,  # Overwrite the original
-                channel_pattern=None,  # Auto-detect
-                overlap_diff_threshold=overlap_diff_threshold,
-                pou=pou,
-                ncc_threshold=ncc_threshold,
-                skip_backup=True,  # Skip backup since we already made one
-                z_slice_for_registration=0,
-                edge_width=edge_width,
-                tensor_backend_engine=tensor_backend_engine
-            )
+            # For first timepoint or when register_once=False, compute registration normally
+            if i == 0 or not register_once:
+                updated_coords = register_and_update_coordinates(
+                    image_directory=base_directory,  # Use base directory instead of timepoint directory
+                    csv_path=coords_csv,
+                    output_csv_path=coords_csv,
+                    channel_pattern=None,  # Auto-detect
+                    overlap_diff_threshold=overlap_diff_threshold,
+                    pou=pou,
+                    ncc_threshold=ncc_threshold,
+                    z_slice_for_registration=0,
+                    edge_width=edge_width,
+                    tensor_backend_engine=tensor_backend_engine,
+                    flatfield_corrections=flatfield_corrections
+                )
+                
+                # Store deltas from first timepoint for later reuse
+                if i == 0 and register_once and len(timepoint_dirs) > 1:
+                    first_timepoint_deltas = {
+                        'dx': (updated_coords['x (mm)'] - original_coords['x (mm)']).values,
+                        'dy': (updated_coords['y (mm)'] - original_coords['y (mm)']).values
+                    }
+                    print(f"Stored registration deltas from first timepoint for reuse")
+            else:
+                # For subsequent timepoints when register_once=True, apply first timepoint's deltas
+                print(f"Applying registration from first timepoint (register_once mode)")
+                updated_coords = original_coords.copy()
+                updated_coords['x (mm)'] = original_coords['x (mm)'] + first_timepoint_deltas['dx']
+                updated_coords['y (mm)'] = original_coords['y (mm)'] + first_timepoint_deltas['dy']
+                
+                # Save to registered_coordinates folder
+                registered_dir = base_directory / "registered_coordinates"
+                registered_dir.mkdir(exist_ok=True)
+                output_path = registered_dir / f"{timepoint}_coordinates.csv"
+                updated_coords.to_csv(output_path, index=False)
+                print(f"Saved registered coordinates to: {output_path}")
+                
             results[timepoint] = updated_coords
             print(f"Successfully processed timepoint {timepoint}")
         except Exception as e:
